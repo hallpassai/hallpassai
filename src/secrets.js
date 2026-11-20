@@ -56,6 +56,46 @@ export function helperScriptPath(homeDir = os.homedir()) {
   return path.join(hallpassDir(homeDir), "read-key.mjs");
 }
 
+export function telemetryPath(homeDir = os.homedir()) {
+  return path.join(hallpassDir(homeDir), "telemetry.json");
+}
+
+export function telemetryDisabled(env = process.env) {
+  return (
+    env.DO_NOT_TRACK === "1" ||
+    env.DO_NOT_TRACK === "true" ||
+    env.HALLPASS_NO_TELEMETRY === "1" ||
+    env.HALLPASS_TELEMETRY === "0"
+  );
+}
+
+export function getAnonymousId(homeDir = os.homedir(), env = process.env) {
+  if (telemetryDisabled(env)) return undefined;
+  const fp = telemetryPath(homeDir);
+  try {
+    if (fs.existsSync(fp)) {
+      assertNotSymlink(fp);
+      const parsed = JSON.parse(fs.readFileSync(fp, "utf8"));
+      if (
+        parsed &&
+        typeof parsed.anonymousId === "string" &&
+        /^hp_cli_[A-Za-z0-9_-]{8,64}$/.test(parsed.anonymousId)
+      ) {
+        return parsed.anonymousId;
+      }
+    }
+    const anonymousId = `hp_cli_${crypto.randomUUID().replace(/-/g, "")}`;
+    writePrivateFile(
+      fp,
+      JSON.stringify({ anonymousId, createdAt: new Date().toISOString() }, null, 2) + "\n",
+      0o600,
+    );
+    return anonymousId;
+  } catch {
+    return undefined;
+  }
+}
+
 export function ensurePrivateDir(dir) {
   assertNotSymlink(dir);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -206,6 +246,34 @@ export function removeCredential(
   if (harness === "all") current.keys = {};
   else delete current.keys[harness];
   writePrivateFile(fp, JSON.stringify(current, null, 2) + "\n", 0o600);
+}
+
+export function purgeHallpassDir(
+  homeDir = os.homedir(),
+  { useKeychain = process.platform === "darwin" } = {},
+) {
+  const removed = [];
+  removeCredential("all", { homeDir, useKeychain });
+  const dir = hallpassDir(homeDir);
+  for (const fileName of [
+    "copilot.env",
+    "read-key.mjs",
+    "credentials.json",
+    "telemetry.json",
+  ]) {
+    const fp = path.join(dir, fileName);
+    if (fs.existsSync(fp)) {
+      assertNotSymlink(fp);
+      fs.unlinkSync(fp);
+      removed.push(fp);
+    }
+  }
+  try {
+    if (fs.existsSync(dir) && fs.readdirSync(dir).length === 0) {
+      fs.rmdirSync(dir);
+    }
+  } catch {}
+  return removed;
 }
 
 export function ensureHelperScript(homeDir = os.homedir()) {

@@ -6,8 +6,10 @@ import {
   assertNotSymlink,
   hallpassDir,
   helperScriptPath,
+  readStoredCredentials,
   storeCredential,
   removeCredential,
+  purgeHallpassDir,
   writePrivateFile,
 } from "./secrets.js";
 
@@ -329,6 +331,19 @@ export function configureAgent(
   if (agent === "claude-code") {
     const settingsPath = path.join(homeDir, ".claude", "settings.json");
     const current = readJsonSafe(settingsPath);
+    const hasNonHallpassClaudeKeys = (() => {
+      const probe = structuredClone(current);
+      if (probe.env && typeof probe.env === "object") {
+        delete probe.env.ANTHROPIC_BASE_URL;
+        delete probe.env.ANTHROPIC_AUTH_TOKEN;
+        delete probe.env.ANTHROPIC_MODEL;
+        if (probe.env.ANTHROPIC_API_KEY === "") delete probe.env.ANTHROPIC_API_KEY;
+        delete probe.env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY;
+        delete probe.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
+        if (!Object.keys(probe.env).length) delete probe.env;
+      }
+      return Object.keys(probe).length > 0;
+    })();
     const next = {
       ...current,
       env: {
@@ -344,7 +359,9 @@ export function configureAgent(
     const content = JSON.stringify(next, null, 2) + "\n";
     if (!dryRun) {
       storeCredential("claude-code", { token, apiBase, model }, { homeDir });
-      const backup = backupOnce(settingsPath, { secret: true });
+      const backup = hasNonHallpassClaudeKeys
+        ? backupOnce(settingsPath, { secret: true })
+        : null;
       writePrivateFile(settingsPath, content, 0o600);
       return {
         agent,
@@ -376,7 +393,12 @@ export function configureAgent(
     });
     if (!dryRun) {
       storeCredential("codex", { token, apiBase, model: compatible }, { homeDir });
-      const backup = backupOnce(configPath, { secret: true });
+      const nonHallpassToml = existing
+        ? stripHallpassFromCodexToml(existing, { removeTopLevelProvider: true }).trim()
+        : "";
+      const backup = nonHallpassToml
+        ? backupOnce(configPath, { secret: true })
+        : null;
       writePrivateFile(configPath, content, 0o600);
       return {
         agent,
@@ -449,8 +471,14 @@ export function configureAgent(
 
     if (!dryRun) {
       storeCredential("opencode", { token, apiBase, model: chosenModel }, { homeDir });
-      const backup = backupOnce(configPath);
-      backupOnce(authPath, { secret: true });
+      const hasOtherProvider = Boolean(
+        Object.keys(currentCfg).some((k) => !["$schema", "model", "provider"].includes(k)) ||
+          Object.keys(currentCfg.provider || {}).some((p) => p !== "hallpass") ||
+          (typeof currentCfg.model === "string" && !currentCfg.model.startsWith("hallpass/")),
+      );
+      const hasOtherAuth = Object.keys(currentAuth).some((k) => k !== "hallpass");
+      const backup = hasOtherProvider ? backupOnce(configPath) : null;
+      if (hasOtherAuth) backupOnce(authPath, { secret: true });
       writePrivateFile(configPath, cfgContent, 0o600);
       writePrivateFile(authPath, authContent, 0o600);
       return {
@@ -495,7 +523,10 @@ export function configureAgent(
     if (!dryRun) {
       storeCredential("copilot", { token, apiBase, model: chosenModel }, { homeDir });
       writePrivateFile(envPath, envContent, 0o600);
-      const backup = backupOnce(rcPath);
+      const nonHallpassRc = existingRc
+        .replace(new RegExp(`\\n?${SHELL_START}[\\s\\S]*?${SHELL_END}\\n?`, "g"), "")
+        .trim();
+      const backup = nonHallpassRc ? backupOnce(rcPath) : null;
       const rcMode = fs.existsSync(rcPath)
         ? fs.statSync(rcPath).mode & 0o777 || 0o600
         : 0o600;
@@ -538,7 +569,11 @@ export function configureAgent(
 
 export function undoAgent(
   agent = "all",
-  { homeDir = os.homedir(), shell = process.env.SHELL || "/bin/zsh" } = {},
+  {
+    homeDir = os.homedir(),
+    shell = process.env.SHELL || "/bin/zsh",
+    fullCleanup = false,
+  } = {},
 ) {
   const targets = agent === "all" ? SUPPORTED_AGENTS : [agent];
   const restored = [];
@@ -555,6 +590,14 @@ export function undoAgent(
       return true;
     }
     return false;
+  };
+
+  const removeIfEmptyDir = (dirPath) => {
+    try {
+      if (fs.existsSync(dirPath) && fs.readdirSync(dirPath).length === 0) {
+        fs.rmdirSync(dirPath);
+      }
+    } catch {}
   };
 
   for (const a of targets) {
@@ -579,6 +622,7 @@ export function undoAgent(
         }
         restored.push(fp);
       }
+      removeIfEmptyDir(path.join(homeDir, ".claude"));
     } else if (a === "codex") {
       const fp = path.join(homeDir, ".codex", "config.toml");
       if (!restoreBak(fp, { secret: true }) && fs.existsSync(fp)) {
@@ -594,6 +638,7 @@ export function undoAgent(
         }
         restored.push(fp);
       }
+      removeIfEmptyDir(path.join(homeDir, ".codex"));
     } else if (a === "opencode") {
       const { configDir: cfgDir, dataDir } = resolveOpencodeDirs(homeDir);
       const cfgPath = path.join(cfgDir, "opencode.json");
@@ -625,27 +670,173 @@ export function undoAgent(
         }
         restored.push(authPath);
       }
+      removeIfEmptyDir(cfgDir);
+      removeIfEmptyDir(dataDir);
     } else if (a === "copilot") {
       const envPath = path.join(hallpassDir(homeDir), "copilot.env");
       if (fs.existsSync(envPath)) {
         assertNotSymlink(envPath);
         fs.unlinkSync(envPath);
+        restored.push(envPath);
       }
-      const rcPath = shell.includes("bash")
+      const primaryRc = shell.includes("bash")
         ? path.join(homeDir, ".bashrc")
         : path.join(homeDir, ".zshrc");
-      if (!restoreBak(rcPath) && fs.existsSync(rcPath)) {
-        assertNotSymlink(rcPath);
-        const raw = fs.readFileSync(rcPath, "utf8");
-        const cleaned = raw.replace(
-          new RegExp(`\\n?${SHELL_START}[\\s\\S]*?${SHELL_END}\\n?`, "g"),
-          "\n",
-        );
-        const rcMode = fs.statSync(rcPath).mode & 0o777 || 0o600;
-        writePrivateFile(rcPath, cleaned, rcMode);
-        restored.push(rcPath);
+      const candidateRcs = Array.from(
+        new Set([
+          primaryRc,
+          path.join(homeDir, ".zshrc"),
+          path.join(homeDir, ".bashrc"),
+          path.join(homeDir, ".bash_profile"),
+          path.join(homeDir, ".config", "fish", "config.fish"),
+        ]),
+      );
+      for (const rcPath of candidateRcs) {
+        if (!restoreBak(rcPath) && fs.existsSync(rcPath)) {
+          assertNotSymlink(rcPath);
+          const raw = fs.readFileSync(rcPath, "utf8");
+          if (raw.includes(SHELL_START)) {
+            const cleaned = raw
+              .replace(
+                new RegExp(`\\n?${SHELL_START}[\\s\\S]*?${SHELL_END}\\n?`, "g"),
+                "\n",
+              )
+              .trimEnd();
+            const rcMode = fs.statSync(rcPath).mode & 0o777 || 0o600;
+            writePrivateFile(rcPath, cleaned ? cleaned + "\n" : "", rcMode);
+            restored.push(rcPath);
+          }
+        }
       }
     }
   }
+
+  const remainingKeys = Object.keys(readStoredCredentials(homeDir).keys || {});
+  if (fullCleanup && agent === "all") {
+    for (const removedFile of purgeHallpassDir(homeDir)) {
+      if (!restored.includes(removedFile)) restored.push(removedFile);
+    }
+  } else if (agent === "all" && remainingKeys.length === 0) {
+    // Remove helper script & empty credentials file while keeping anonymous telemetry ID intact on light undo.
+    for (const fn of ["copilot.env", "read-key.mjs", "credentials.json"]) {
+      const fp = path.join(hallpassDir(homeDir), fn);
+      if (fs.existsSync(fp)) {
+        assertNotSymlink(fp);
+        fs.unlinkSync(fp);
+      }
+    }
+    removeIfEmptyDir(hallpassDir(homeDir));
+  }
+
   return restored;
+}
+
+export function inspectAgentConfig(
+  agent,
+  { homeDir = os.homedir(), shell = process.env.SHELL || "/bin/zsh" } = {},
+) {
+  try {
+    if (agent === "claude-code") {
+      const fp = path.join(homeDir, ".claude", "settings.json");
+      const cfg = readJsonSafe(fp);
+      const ok = Boolean(
+        cfg?.env?.ANTHROPIC_BASE_URL && cfg?.env?.ANTHROPIC_AUTH_TOKEN,
+      );
+      return {
+        ok,
+        configPath: fp,
+        note: ok
+          ? "settings.json wired to HallPass"
+          : "settings.json missing HallPass env",
+      };
+    }
+    if (agent === "codex") {
+      const fp = path.join(homeDir, ".codex", "config.toml");
+      const raw = fs.existsSync(fp) ? fs.readFileSync(fp, "utf8") : "";
+      const helper = helperScriptPath(homeDir);
+      const ok =
+        raw.includes('model_provider = "hallpass"') && fs.existsSync(helper);
+      return {
+        ok,
+        configPath: fp,
+        note: ok
+          ? "config.toml + credential helper present"
+          : "config.toml or read-key.mjs missing",
+      };
+    }
+    if (agent === "opencode") {
+      const { configDir, dataDir } = resolveOpencodeDirs(homeDir);
+      const cfgPath = path.join(configDir, "opencode.json");
+      const authPath = path.join(dataDir, "auth.json");
+      const cfg = readJsonSafe(cfgPath);
+      const auth = readJsonSafe(authPath);
+      const ok = Boolean(cfg?.provider?.hallpass && auth?.hallpass?.key);
+      return {
+        ok,
+        configPath: cfgPath,
+        note: ok
+          ? "opencode.json + auth.json wired to HallPass"
+          : "opencode config or auth missing",
+      };
+    }
+    if (agent === "copilot") {
+      const envPath = path.join(hallpassDir(homeDir), "copilot.env");
+      const rcPath = shell.includes("bash")
+        ? path.join(homeDir, ".bashrc")
+        : path.join(homeDir, ".zshrc");
+      const rcRaw = fs.existsSync(rcPath) ? fs.readFileSync(rcPath, "utf8") : "";
+      const ok = fs.existsSync(envPath) && rcRaw.includes(SHELL_START);
+      return {
+        ok,
+        configPath: envPath,
+        note: ok
+          ? `copilot.env + ${path.basename(rcPath)} profile block active`
+          : "copilot.env or shell profile block missing",
+      };
+    }
+    if (agent === "cursor") {
+      const creds = readStoredCredentials(homeDir);
+      const ok = Boolean(creds.keys?.cursor?.token);
+      return {
+        ok,
+        configPath: "Cursor → Settings → Models",
+        note: ok
+          ? "Credentials saved locally (set in Cursor → Settings → Models)"
+          : "No stored Cursor credentials",
+      };
+    }
+  } catch (err) {
+    return { ok: false, configPath: agent, note: err.message };
+  }
+  return { ok: false, configPath: agent, note: "Unknown tool" };
+}
+
+export function switchAgentModel(
+  agent,
+  newModel,
+  { homeDir = os.homedir(), shell = process.env.SHELL || "/bin/zsh" } = {},
+) {
+  const creds = readStoredCredentials(homeDir);
+  const entry = creds.keys?.[agent];
+  if (!entry?.token || !entry?.apiBase) {
+    throw new Error(
+      `${agent} is not configured yet. Pair it first at https://app.hallpassai.com/start.html#connect`,
+    );
+  }
+  return configureAgent(
+    agent,
+    {
+      token: entry.token,
+      apiBase: entry.apiBase,
+      model: newModel,
+      models: [
+        {
+          id: newModel,
+          name: newModel,
+          protocols: ["messages", "responses", "chat/completions"],
+        },
+      ],
+    },
+    { homeDir, shell, dryRun: false },
+  );
 }

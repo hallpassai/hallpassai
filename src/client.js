@@ -189,7 +189,49 @@ export function validateClaimPayload(body, resolvedOrigin) {
   };
 }
 
-export async function claimCode(code, { origin, fetcher = fetch } = {}) {
+export function originFromApiBase(apiBase, explicitOrigin = null) {
+  if (explicitOrigin) {
+    return validateEndpointUrl(explicitOrigin, { requireRootPath: true });
+  }
+  const safeBase = validateEndpointUrl(apiBase);
+  const u = new URL(safeBase);
+  if (u.hostname.toLowerCase() === "api.hallpassai.com") {
+    return "https://app.hallpassai.com";
+  }
+  return u.origin;
+}
+
+export function buildCliMeta({
+  cliVersion,
+  anonymousId,
+  targetHarness,
+  modelId,
+  configuredHarnesses,
+  gatewayVerified,
+  healthy,
+} = {}) {
+  const meta = {
+    platform: process.platform,
+    arch: process.arch,
+  };
+  if (typeof cliVersion === "string" && cliVersion) meta.cliVersion = cliVersion;
+  if (typeof anonymousId === "string" && anonymousId)
+    meta.anonymousId = anonymousId;
+  if (typeof targetHarness === "string" && targetHarness)
+    meta.targetHarness = targetHarness;
+  if (typeof modelId === "string" && modelId) meta.modelId = modelId;
+  if (Array.isArray(configuredHarnesses) && configuredHarnesses.length)
+    meta.configuredHarnesses = configuredHarnesses;
+  if (typeof gatewayVerified === "boolean")
+    meta.gatewayVerified = gatewayVerified;
+  if (typeof healthy === "boolean") meta.healthy = healthy;
+  return meta;
+}
+
+export async function claimCode(
+  code,
+  { origin, meta = null, fetcher = fetch } = {},
+) {
   const parsed = normalizeCode(code);
   if (!parsed) {
     const err = new Error(
@@ -199,10 +241,13 @@ export async function claimCode(code, { origin, fetcher = fetch } = {}) {
     throw err;
   }
   const baseOrigin = resolveOrigin(parsed.prefix, origin);
+  const ua = meta?.cliVersion
+    ? `hallpassai/${meta.cliVersion} (${process.platform}; ${process.arch})`
+    : `hallpassai (${process.platform}; ${process.arch})`;
   const res = await fetcher(`${baseOrigin}/api/core/pair/claim`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ code: parsed.code }),
+    headers: { "Content-Type": "application/json", "User-Agent": ua },
+    body: JSON.stringify({ code: parsed.code, ...(meta ? { meta } : {}) }),
     signal: AbortSignal.timeout(15000),
     redirect: "error",
   });
@@ -234,17 +279,18 @@ export async function claimCode(code, { origin, fetcher = fetch } = {}) {
   return validateClaimPayload(body, baseOrigin);
 }
 
-export async function verifyGatewayReachable(
+export async function fetchLiveModels(
   { apiBase, token },
   { fetcher = fetch } = {},
 ) {
+  const t0 = Date.now();
   try {
     const safeBase = validateEndpointUrl(apiBase);
     if (
       typeof token !== "string" ||
       !/^[A-Za-z0-9_.-]{16,256}$/.test(token)
     ) {
-      return false;
+      return { ok: false, latencyMs: Date.now() - t0, models: [] };
     }
     const res = await fetcher(`${safeBase}/models`, {
       method: "GET",
@@ -252,14 +298,34 @@ export async function verifyGatewayReachable(
       signal: AbortSignal.timeout(10000),
       redirect: "error",
     });
-    return res.ok;
+    if (!res.ok) return { ok: false, latencyMs: Date.now() - t0, models: [] };
+    const body = await res.json().catch(() => ({}));
+    const models = Array.isArray(body?.data)
+      ? body.data
+          .filter(
+            (m) =>
+              m &&
+              typeof m.id === "string" &&
+              /^[A-Za-z0-9._:/-]{1,128}$/.test(m.id),
+          )
+          .map((m) => m.id)
+      : [];
+    return { ok: true, latencyMs: Date.now() - t0, models };
   } catch {
-    return false;
+    return { ok: false, latencyMs: Date.now() - t0, models: [] };
   }
 }
 
+export async function verifyGatewayReachable(
+  { apiBase, token },
+  { fetcher = fetch } = {},
+) {
+  const res = await fetchLiveModels({ apiBase, token }, { fetcher });
+  return res.ok;
+}
+
 export async function sendPairingStatus(
-  { origin, progressToken, phase, errorCode },
+  { origin, progressToken, phase, errorCode, meta = null },
   { fetcher = fetch } = {},
 ) {
   if (!origin || !progressToken) return;
@@ -268,8 +334,68 @@ export async function sendPairingStatus(
     await fetcher(`${safeOrigin}/api/core/pair/status`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ progressToken, phase, errorCode }),
+      body: JSON.stringify({
+        progressToken,
+        phase,
+        errorCode,
+        ...(meta ? { meta } : {}),
+      }),
       signal: AbortSignal.timeout(8000),
+      redirect: "error",
+    });
+  } catch {}
+}
+
+export async function revokeServerToken(
+  { origin, apiBase, token, meta = null },
+  { fetcher = fetch } = {},
+) {
+  if (typeof token !== "string" || !/^hp_live_[A-Za-z0-9_-]{43}$/.test(token)) {
+    return false;
+  }
+  try {
+    const safeOrigin = originFromApiBase(apiBase, origin);
+    const res = await fetcher(`${safeOrigin}/api/core/cli/revoke`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(meta ? { meta } : {}),
+      signal: AbortSignal.timeout(4000),
+      redirect: "error",
+    });
+    if (!res.ok) return false;
+    const body = await res.json().catch(() => ({}));
+    return Boolean(body?.revoked);
+  } catch {
+    return false;
+  }
+}
+
+export async function sendCliEvent(
+  name,
+  { origin, apiBase, token, meta = null } = {},
+  { fetcher = fetch } = {},
+) {
+  try {
+    const safeOrigin = origin
+      ? validateEndpointUrl(origin, { requireRootPath: true })
+      : apiBase
+        ? originFromApiBase(apiBase)
+        : "https://app.hallpassai.com";
+    const headers = { "Content-Type": "application/json" };
+    if (
+      typeof token === "string" &&
+      /^hp_live_[A-Za-z0-9_-]{43}$/.test(token)
+    ) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+    await fetcher(`${safeOrigin}/api/core/cli/event`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name, ...(meta ? { meta } : {}) }),
+      signal: AbortSignal.timeout(2500),
       redirect: "error",
     });
   } catch {}

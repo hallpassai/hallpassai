@@ -8,16 +8,26 @@ import {
   detectInstalledAgents,
   configureAgent,
   undoAgent,
+  inspectAgentConfig,
+  switchAgentModel,
   copyToClipboard,
 } from "../src/adapters.js";
 import {
   normalizeCode,
   resolveOrigin,
   claimCode,
+  fetchLiveModels,
   verifyGatewayReachable,
   sendPairingStatus,
+  revokeServerToken,
+  sendCliEvent,
+  buildCliMeta,
 } from "../src/client.js";
-import { readStoredCredentials } from "../src/secrets.js";
+import {
+  readStoredCredentials,
+  getAnonymousId,
+  telemetryDisabled,
+} from "../src/secrets.js";
 
 const require = createRequire(import.meta.url);
 const pkg = require("../package.json");
@@ -36,17 +46,30 @@ const dim = (s) => (process.stdout.isTTY ? `\x1b[2m${s}\x1b[0m` : s);
 const bold = (s) => (process.stdout.isTTY ? `\x1b[1m${s}\x1b[0m` : s);
 const red = (s) => (process.stderr.isTTY ? `\x1b[31m${s}\x1b[0m` : s);
 
+const UNINSTALL_ALIASES = new Set([
+  "uninstall",
+  "cleanup",
+  "clean",
+  "disconnect",
+  "remove",
+]);
+
 function printHelp() {
   console.log(`${bold("hallpassai")} v${pkg.version} — One-command setup for HallPass AI Gateway
 
 ${bold("Usage:")}
   npx hallpassai@latest <PAIRING-CODE> [options]
   npx hallpassai@latest status
+  npx hallpassai@latest doctor
+  npx hallpassai@latest models
+  npx hallpassai@latest use <MODEL-ID> [--agent <name>]
   npx hallpassai@latest undo [--agent <name>]
+  npx hallpassai@latest uninstall [--agent <name>] [--keep-keys]
 
 ${bold("Options:")}
-  --agent <name>   Override target tool (${SUPPORTED_AGENTS.join(", ")})
+  --agent <name>   Target a specific tool (${SUPPORTED_AGENTS.join(", ")})
   --dry-run        Preview configuration changes without claiming code or writing files
+  --keep-keys      Keep server API keys active during uninstall (local cleanup only)
   --origin <url>   Override HallPass server origin
   -h, --help       Show help
   -v, --version    Show version
@@ -57,8 +80,10 @@ export function parseArgs(argv) {
   const out = {
     command: null,
     code: null,
+    modelArg: null,
     agent: null,
     dryRun: false,
+    keepKeys: false,
     origin: null,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -67,12 +92,16 @@ export function parseArgs(argv) {
       out.command = "help";
       return out;
     }
-    if (a === "-v" || a === "--version") {
+    if (a === "-v" || a === "--version" || a === "version") {
       out.command = "version";
       return out;
     }
     if (a === "--dry-run") {
       out.dryRun = true;
+      continue;
+    }
+    if (a === "--keep-keys") {
+      out.keepKeys = true;
       continue;
     }
     if (a === "--agent") {
@@ -101,8 +130,20 @@ export function parseArgs(argv) {
       if (!out.origin) throw new Error("Missing value for --origin.");
       continue;
     }
-    if (!out.command && ["connect", "pair", "status", "undo"].includes(a)) {
-      out.command = a;
+    if (!out.command) {
+      if (UNINSTALL_ALIASES.has(a)) {
+        out.command = "uninstall";
+        continue;
+      }
+      if (
+        ["connect", "pair", "status", "doctor", "undo", "models", "use", "model"].includes(a)
+      ) {
+        out.command = a === "model" ? "use" : a;
+        continue;
+      }
+    }
+    if (out.command === "use" && !out.modelArg) {
+      out.modelArg = a;
       continue;
     }
     if (!out.code) out.code = a;
@@ -147,7 +188,7 @@ async function runCursorInteractive(values) {
   }
 }
 
-export async function main(argv = process.argv.slice(2)) {
+export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
   const args = parseArgs(argv);
   if (args.command === "help") {
     printHelp();
@@ -157,26 +198,95 @@ export async function main(argv = process.argv.slice(2)) {
     console.log(pkg.version);
     return 0;
   }
-  if (args.command === "undo") {
+
+  const validateAgentFlag = () => {
     if (
       args.agent &&
       args.agent !== "all" &&
       !SUPPORTED_AGENTS.includes(args.agent)
     ) {
-      console.error(red(`Unknown agent: ${cleanLog(args.agent)}`));
-      return 1;
+      console.error(
+        red(
+          `Unknown agent: ${cleanLog(args.agent)}. Choose one of: ${SUPPORTED_AGENTS.join(", ")}`,
+        ),
+      );
+      return false;
     }
-    const restored = undoAgent(args.agent || "all");
-    console.log(
-      restored.length
-        ? `${green("✓")} Restored ${restored.length} file(s):\n  ${restored.join("\n  ")}`
-        : `${green("✓")} HallPass credentials cleared.`,
+    return true;
+  };
+
+  if (args.command === "undo" || args.command === "uninstall") {
+    if (!validateAgentFlag()) return 1;
+    const target = args.agent || "all";
+    const isUninstall = args.command === "uninstall";
+    const creds = readStoredCredentials();
+    const anonId = !telemetryDisabled() ? getAnonymousId() : undefined;
+    const matchingEntries = Object.entries(creds.keys || {}).filter(
+      ([k]) => target === "all" || k === target,
     );
+    const hadCursor = matchingEntries.some(([k]) => k === "cursor");
+    const meta = buildCliMeta({
+      cliVersion: pkg.version,
+      anonymousId: anonId,
+      targetHarness: target,
+      configuredHarnesses: matchingEntries.map(([k]) => k),
+    });
+
+    let revokedCount = 0;
+    if (isUninstall && !args.keepKeys && matchingEntries.length) {
+      const seenTokens = new Set();
+      for (const [, info] of matchingEntries) {
+        if (!info?.token || seenTokens.has(info.token)) continue;
+        seenTokens.add(info.token);
+        const ok = await revokeServerToken(
+          { origin: args.origin, apiBase: info.apiBase, token: info.token, meta },
+          fetcher ? { fetcher } : undefined,
+        );
+        if (ok) revokedCount++;
+      }
+    } else if (!telemetryDisabled() && matchingEntries.length) {
+      const first = matchingEntries[0][1];
+      await sendCliEvent(
+        isUninstall ? "cli_uninstalled" : "cli_undo",
+        { origin: args.origin, apiBase: first?.apiBase, token: first?.token, meta },
+        fetcher ? { fetcher } : undefined,
+      );
+    }
+
+    const restored = undoAgent(target, { fullCleanup: isUninstall });
+    if (isUninstall) {
+      console.log(
+        `${green("✓")} HallPass uninstalled${target === "all" ? "" : ` for ${bold(cleanLog(target))}`}.`,
+      );
+      if (revokedCount > 0) {
+        console.log(
+          `  ${dim("revoked")} ${revokedCount} HallPass API key${revokedCount === 1 ? "" : "s"} on server`,
+        );
+      }
+      if (restored.length) {
+        for (const f of restored) console.log(`  ${dim("cleaned")} ${f}`);
+      }
+      if (hadCursor) {
+        console.log(
+          `  ${dim("note")}    In Cursor → Settings → Models, toggle off Override OpenAI Base URL.`,
+        );
+      }
+    } else {
+      console.log(
+        restored.length
+          ? `${green("✓")} Restored ${restored.length} file(s):\n  ${restored.join("\n  ")}`
+          : `${green("✓")} HallPass credentials cleared.`,
+      );
+    }
     return 0;
   }
-  if (args.command === "status") {
+
+  if (args.command === "status" || args.command === "doctor") {
     const creds = readStoredCredentials();
-    const entries = Object.entries(creds.keys || {});
+    const entries = Object.entries(creds.keys || {}).filter(
+      ([k]) => !args.agent || args.agent === "all" || k === args.agent,
+    );
+    const anonId = !telemetryDisabled() ? getAnonymousId() : undefined;
     if (!entries.length) {
       console.log("No HallPass tools configured on this machine yet.");
       console.log(
@@ -184,13 +294,124 @@ export async function main(argv = process.argv.slice(2)) {
       );
       return 0;
     }
+    let allHealthy = true;
     for (const [agent, info] of entries) {
-      const ok = await verifyGatewayReachable({
-        apiBase: info.apiBase,
-        token: info.token,
-      });
+      const live = await fetchLiveModels(
+        { apiBase: info.apiBase, token: info.token },
+        fetcher ? { fetcher } : undefined,
+      );
+      const disk = inspectAgentConfig(agent);
+      const modelOk =
+        !live.models.length || live.models.includes(info.model);
+      const healthy = live.ok && disk.ok && modelOk;
+      if (!healthy) allHealthy = false;
       console.log(
-        `${ok ? green("✓") : red("✗")} ${bold(cleanLog(agent))} — model: ${cleanLog(info.model)} · endpoint: ${cleanLog(info.apiBase)} · key: ${ok ? "active" : "invalid or unreachable"}`,
+        `${healthy ? green("✓") : red("✗")} ${bold(cleanLog(agent))} — model: ${cleanLog(info.model)} · endpoint: ${cleanLog(info.apiBase)} · key: ${live.ok ? `active (${live.latencyMs}ms)` : "invalid or unreachable"}`,
+      );
+      if (args.command === "doctor" || !disk.ok || !modelOk) {
+        console.log(
+          `  ${dim("config")}  ${disk.ok ? "ok" : "drift detected"} — ${cleanLog(disk.note)}`,
+        );
+        console.log(`  ${dim("endpoint")} ${cleanLog(info.apiBase)}`);
+        if (live.ok && !modelOk) {
+          console.log(
+            `  ${dim("warning")} Model "${cleanLog(info.model)}" not in live catalog (${live.models.slice(0, 4).map(cleanLog).join(", ")}). Switch with \`npx hallpassai use <model>\`.`,
+          );
+        }
+      }
+    }
+    if (!telemetryDisabled()) {
+      const first = entries[0][1];
+      await sendCliEvent(
+        args.command === "doctor" ? "cli_doctor" : "cli_status",
+        {
+          origin: args.origin,
+          apiBase: first?.apiBase,
+          token: first?.token,
+          meta: buildCliMeta({
+            cliVersion: pkg.version,
+            anonymousId: anonId,
+            configuredHarnesses: entries.map(([k]) => k),
+            healthy: allHealthy,
+          }),
+        },
+        fetcher ? { fetcher } : undefined,
+      );
+    }
+    return allHealthy ? 0 : 1;
+  }
+
+  if (args.command === "models") {
+    const creds = readStoredCredentials();
+    const first = Object.values(creds.keys || {})[0];
+    if (!first?.token || !first?.apiBase) {
+      console.error(
+        red(
+          "No active HallPass tool configured yet. Pair first at https://app.hallpassai.com/start.html#connect",
+        ),
+      );
+      return 1;
+    }
+    const live = await fetchLiveModels(
+      { apiBase: first.apiBase, token: first.token },
+      fetcher ? { fetcher } : undefined,
+    );
+    if (!live.ok) {
+      console.error(red("Could not reach HallPass gateway with stored key."));
+      return 1;
+    }
+    console.log(`${bold(`Available models (${live.models.length}):`)}`);
+    for (const m of live.models) console.log(`  • ${cleanLog(m)}`);
+    console.log(
+      dim("\nSwitch models anytime with `npx hallpassai use <model-id>`."),
+    );
+    return 0;
+  }
+
+  if (args.command === "use") {
+    if (!validateAgentFlag()) return 1;
+    if (!args.modelArg || !/^[A-Za-z0-9._:/-]{1,128}$/.test(args.modelArg)) {
+      console.error(
+        red("Provide a valid model ID (e.g. `npx hallpassai use claude-sonnet-4-6`)."),
+      );
+      return 1;
+    }
+    const creds = readStoredCredentials();
+    const targets =
+      args.agent && args.agent !== "all"
+        ? [args.agent]
+        : Object.keys(creds.keys || {});
+    if (!targets.length) {
+      console.error(
+        red(
+          "No HallPass tools configured yet. Pair first at https://app.hallpassai.com/start.html#connect",
+        ),
+      );
+      return 1;
+    }
+    for (const agent of targets) {
+      const res = switchAgentModel(agent, args.modelArg);
+      console.log(
+        `${green("✓")} Updated ${bold(cleanLog(agent))} → model ${bold(cleanLog(args.modelArg))}`,
+      );
+      for (const f of res.files) console.log(`  ${dim("updated")} ${f}`);
+    }
+    if (!telemetryDisabled()) {
+      const first = creds.keys[targets[0]];
+      await sendCliEvent(
+        "cli_model_switched",
+        {
+          origin: args.origin,
+          apiBase: first?.apiBase,
+          token: first?.token,
+          meta: buildCliMeta({
+            cliVersion: pkg.version,
+            anonymousId: getAnonymousId(),
+            modelId: args.modelArg,
+            configuredHarnesses: targets,
+          }),
+        },
+        fetcher ? { fetcher } : undefined,
       );
     }
     return 0;
@@ -203,18 +424,7 @@ export async function main(argv = process.argv.slice(2)) {
     );
     return 1;
   }
-  if (
-    args.agent &&
-    args.agent !== "all" &&
-    !SUPPORTED_AGENTS.includes(args.agent)
-  ) {
-    console.error(
-      red(
-        `Unsupported --agent "${cleanLog(args.agent)}". Choose one of: ${SUPPORTED_AGENTS.join(", ")}`,
-      ),
-    );
-    return 1;
-  }
+  if (!validateAgentFlag()) return 1;
 
   // Dry-run previews local adapter output WITHOUT consuming the single-use server pairing code or rotating live keys.
   if (args.dryRun) {
@@ -256,8 +466,19 @@ export async function main(argv = process.argv.slice(2)) {
     return 0;
   }
 
+  const anonId = !telemetryDisabled() ? getAnonymousId() : undefined;
+  const claimMeta = buildCliMeta({
+    cliVersion: pkg.version,
+    anonymousId: anonId,
+    targetHarness: args.agent || undefined,
+  });
+
   console.log(`${dim("→")} Claiming HallPass pairing code…`);
-  const claimed = await claimCode(args.code, { origin: args.origin });
+  const claimed = await claimCode(args.code, {
+    origin: args.origin,
+    meta: claimMeta,
+    ...(fetcher ? { fetcher } : {}),
+  });
   const targetHarness = args.agent || claimed.harness;
   const agents =
     targetHarness === "all" ? detectInstalledAgents() : [targetHarness];
@@ -275,25 +496,47 @@ export async function main(argv = process.argv.slice(2)) {
       console.log(`\n${bold("Next:")} ${res.nextStep}`);
     }
 
-    const reachable = await verifyGatewayReachable(claimed);
+    const reachable = await verifyGatewayReachable(
+      claimed,
+      fetcher ? { fetcher } : undefined,
+    );
     if (reachable) {
       console.log(
-        `${dim("✓ Verified gateway connection (0 credits used). Undo anytime with `npx hallpassai undo`.")}`,
+        `${dim("✓ Verified gateway connection (0 credits used). Cleanup anytime with `npx hallpassai uninstall`.")}`,
       );
     }
-    await sendPairingStatus({
-      origin: claimed.resolvedOrigin,
-      progressToken: claimed.progressToken,
-      phase: "configured",
-    });
+    await sendPairingStatus(
+      {
+        origin: claimed.resolvedOrigin,
+        progressToken: claimed.progressToken,
+        phase: "configured",
+        meta: buildCliMeta({
+          cliVersion: pkg.version,
+          anonymousId: anonId,
+          targetHarness,
+          modelId: claimed.model,
+          configuredHarnesses: agents,
+          gatewayVerified: reachable,
+        }),
+      },
+      fetcher ? { fetcher } : undefined,
+    );
     return 0;
   } catch (err) {
-    await sendPairingStatus({
-      origin: claimed.resolvedOrigin,
-      progressToken: claimed.progressToken,
-      phase: "error",
-      errorCode: "cli_write_failed",
-    });
+    await sendPairingStatus(
+      {
+        origin: claimed.resolvedOrigin,
+        progressToken: claimed.progressToken,
+        phase: "error",
+        errorCode: "cli_write_failed",
+        meta: buildCliMeta({
+          cliVersion: pkg.version,
+          anonymousId: anonId,
+          targetHarness,
+        }),
+      },
+      fetcher ? { fetcher } : undefined,
+    );
     throw err;
   }
 }

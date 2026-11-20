@@ -44,10 +44,21 @@ npx hallpassai@latest HP-XXXX-XXXX
 # Preview file changes locally without consuming the pairing code or modifying disk
 npx hallpassai@latest HP-XXXX-XXXX --dry-run
 
-# Check configured tools and verify API key health (uses 0 credits)
+# Check configured tools, config integrity, and gateway latency (uses 0 credits)
 npx hallpassai@latest status
+npx hallpassai@latest doctor
 
-# Restore backups and remove HallPass configuration
-npx hallpassai@latest undo
-npx hallpassai@latest undo --agent claude-code
+# List live models and switch your configured tool(s) to another model
+npx hallpassai@latest models
+npx hallpassai@latest use claude-sonnet-4-6
+
+# Restore backups (local config revert)
+npx hallpassai@latest undo [--agent claude-code]
+
+# Full uninstall & cleanup: revokes server API key(s), restores .hallpass.bak backups,
+# cleans shell profiles & macOS Keychain, and removes ~/.config/hallpass
+npx hallpassai@latest uninstall
+npx hallpassai@latest uninstall --agent claude-code
 ```
+
+Set `DO_NOT_TRACK=1` or `HALLPASS_NO_TELEMETRY=1` to disable anonymous CLI setup diagnostics.

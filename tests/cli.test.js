@@ -352,10 +352,59 @@ test("end-to-end CLI claims pairing code over HTTP, configures tool, verifies /v
     assert.equal(calls.length, 3);
     assert.equal(calls[0].url, "/api/core/pair/claim");
     assert.equal(calls[0].body.code, "HPL-ABCD-2345");
+    assert.match(calls[0].body.meta.anonymousId, /^hp_cli_[a-f0-9]{32}$/);
+    assert.equal(calls[0].body.meta.platform, process.platform);
     assert.equal(calls[1].url, "/v1/models");
     assert.equal(calls[1].auth, `Bearer ${SAMPLE_PAYLOAD.token}`);
     assert.equal(calls[2].url, "/api/core/pair/status");
     assert.equal(calls[2].body.phase, "configured");
+    assert.deepEqual(calls[2].body.meta.configuredHarnesses, ["claude-code"]);
+    assert.equal(calls[2].body.meta.gatewayVerified, true);
+
+    // Test doctor, models, use <model>, and uninstall (server key revoke + full directory purge)
+    let revokedAuth = null;
+    server.removeAllListeners("request");
+    server.on("request", async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      res.setHeader("Content-Type", "application/json");
+      if (req.url === "/v1/models") {
+        res.end(
+          JSON.stringify({
+            object: "list",
+            data: [{ id: "claude-sonnet-4-6" }, { id: "gpt-5.4" }],
+          }),
+        );
+      } else if (req.url === "/api/core/cli/revoke") {
+        revokedAuth = req.headers.authorization;
+        res.end(JSON.stringify({ ok: true, revoked: true }));
+      } else if (req.url === "/api/core/cli/event") {
+        res.end(JSON.stringify({ ok: true, recorded: true }));
+      } else {
+        res.statusCode = 404;
+        res.end("{}");
+      }
+    });
+
+    assert.equal(await cliMain(["doctor", "--origin", base]), 0);
+    assert.equal(await cliMain(["models", "--origin", base]), 0);
+    assert.equal(await cliMain(["use", "gpt-5.4", "--origin", base]), 0);
+    const updatedClaude = JSON.parse(
+      fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"),
+    );
+    assert.equal(updatedClaude.env.ANTHROPIC_MODEL, "gpt-5.4");
+
+    assert.equal(await cliMain(["uninstall", "--origin", base]), 0);
+    assert.equal(revokedAuth, `Bearer ${SAMPLE_PAYLOAD.token}`);
+    assert.equal(
+      fs.existsSync(path.join(dir, ".config", "hallpass")),
+      false,
+      "~/.config/hallpass directory must be purged on full uninstall",
+    );
+    assert.equal(
+      fs.existsSync(path.join(dir, ".claude", "settings.json")),
+      false,
+    );
   } finally {
     process.env.HOME = prevHome;
     if (prevCfg === undefined) delete process.env.HALLPASS_CONFIG_DIR;
