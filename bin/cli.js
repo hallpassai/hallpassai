@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import {
   SUPPORTED_AGENTS,
+  VALID_REASONING_LEVELS,
   detectInstalledAgents,
   configureAgent,
   undoAgent,
@@ -17,6 +18,7 @@ import {
   resolveOrigin,
   claimCode,
   fetchLiveModels,
+  fetchCatalogDetails,
   verifyGatewayReachable,
   sendPairingStatus,
   revokeServerToken,
@@ -58,21 +60,23 @@ function printHelp() {
   console.log(`${bold("hallpassai")} v${pkg.version} — One-command setup for HallPass AI Gateway
 
 ${bold("Usage:")}
-  npx hallpassai@latest <PAIRING-CODE> [options]
-  npx hallpassai@latest status
-  npx hallpassai@latest doctor
-  npx hallpassai@latest models
-  npx hallpassai@latest use <MODEL-ID> [--agent <name>]
+  npx hallpassai@latest <PAIRING-CODE> [--reasoning <level>]
+  npx hallpassai@latest models [--provider <name>] [--search <query>]
+  npx hallpassai@latest use [MODEL-ID] [--reasoning <level>] [--agent <name>]
+  npx hallpassai@latest status | doctor
   npx hallpassai@latest undo [--agent <name>]
   npx hallpassai@latest uninstall [--agent <name>] [--keep-keys]
 
 ${bold("Options:")}
-  --agent <name>   Target a specific tool (${SUPPORTED_AGENTS.join(", ")})
-  --dry-run        Preview configuration changes without claiming code or writing files
-  --keep-keys      Keep server API keys active during uninstall (local cleanup only)
-  --origin <url>   Override HallPass server origin
-  -h, --help       Show help
-  -v, --version    Show version
+  -r, --reasoning <lvl>  Set reasoning depth (auto, low, medium, high, max, xhigh)
+  --agent <name>         Target a specific tool (${SUPPORTED_AGENTS.join(", ")})
+  --provider <name>      Filter \`models\` list by provider (e.g. Anthropic, OpenAI, DeepSeek)
+  --search <query>       Search \`models\` list by name or ID
+  --dry-run              Preview configuration changes without claiming code or writing files
+  --keep-keys            Keep server API keys active during uninstall (local cleanup only)
+  --origin <url>         Override HallPass server origin
+  -h, --help             Show help
+  -v, --version          Show version
 `);
 }
 
@@ -81,6 +85,9 @@ export function parseArgs(argv) {
     command: null,
     code: null,
     modelArg: null,
+    reasoning: null,
+    provider: null,
+    search: null,
     agent: null,
     dryRun: false,
     keepKeys: false,
@@ -117,6 +124,45 @@ export function parseArgs(argv) {
       if (!out.agent) throw new Error("Missing value for --agent.");
       continue;
     }
+    if (a === "-r" || a === "--reasoning" || a === "--effort") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        throw new Error(`Missing value for ${a}.`);
+      }
+      out.reasoning = next.toLowerCase();
+      continue;
+    }
+    if (a.startsWith("--reasoning=") || a.startsWith("--effort=")) {
+      out.reasoning = a.split("=")[1]?.toLowerCase() || "";
+      if (!out.reasoning) throw new Error("Missing value for --reasoning.");
+      continue;
+    }
+    if (a === "--provider") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        throw new Error("Missing value for --provider.");
+      }
+      out.provider = next;
+      continue;
+    }
+    if (a.startsWith("--provider=")) {
+      out.provider = a.slice(11);
+      if (!out.provider) throw new Error("Missing value for --provider.");
+      continue;
+    }
+    if (a === "--search") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        throw new Error("Missing value for --search.");
+      }
+      out.search = next;
+      continue;
+    }
+    if (a.startsWith("--search=")) {
+      out.search = a.slice(9);
+      if (!out.search) throw new Error("Missing value for --search.");
+      continue;
+    }
     if (a === "--origin") {
       const next = argv[++i];
       if (!next || next.startsWith("-")) {
@@ -144,6 +190,10 @@ export function parseArgs(argv) {
     }
     if (out.command === "use" && !out.modelArg) {
       out.modelArg = a;
+      continue;
+    }
+    if (out.command === "models" && !out.search) {
+      out.search = a;
       continue;
     }
     if (!out.code) out.code = a;
@@ -197,6 +247,14 @@ export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
   if (args.command === "version") {
     console.log(pkg.version);
     return 0;
+  }
+  if (args.reasoning && !VALID_REASONING_LEVELS.has(args.reasoning)) {
+    console.error(
+      red(
+        `Invalid --reasoning "${cleanLog(args.reasoning)}". Choose one of: auto, low, medium, high, max, xhigh`,
+      ),
+    );
+    return 1;
   }
 
   const validateAgentFlag = () => {
@@ -305,8 +363,9 @@ export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
         !live.models.length || live.models.includes(info.model);
       const healthy = live.ok && disk.ok && modelOk;
       if (!healthy) allHealthy = false;
+      const reasoningBadge = info.reasoning ? ` · reasoning: ${cleanLog(info.reasoning)}` : "";
       console.log(
-        `${healthy ? green("✓") : red("✗")} ${bold(cleanLog(agent))} — model: ${cleanLog(info.model)} · endpoint: ${cleanLog(info.apiBase)} · key: ${live.ok ? `active (${live.latencyMs}ms)` : "invalid or unreachable"}`,
+        `${healthy ? green("✓") : red("✗")} ${bold(cleanLog(agent))} — model: ${cleanLog(info.model)}${reasoningBadge} · endpoint: ${cleanLog(info.apiBase)} · key: ${live.ok ? `active (${live.latencyMs}ms)` : "invalid or unreachable"}`,
       );
       if (args.command === "doctor" || !disk.ok || !modelOk) {
         console.log(
@@ -352,30 +411,70 @@ export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
       );
       return 1;
     }
-    const live = await fetchLiveModels(
-      { apiBase: first.apiBase, token: first.token },
+    const detailed = await fetchCatalogDetails(
+      { apiBase: first.apiBase, origin: args.origin },
       fetcher ? { fetcher } : undefined,
     );
-    if (!live.ok) {
-      console.error(red("Could not reach HallPass gateway with stored key."));
-      return 1;
+    let rows = detailed;
+    if (!rows.length) {
+      const live = await fetchLiveModels(
+        { apiBase: first.apiBase, token: first.token },
+        fetcher ? { fetcher } : undefined,
+      );
+      if (!live.ok) {
+        console.error(red("Could not reach HallPass gateway with stored key."));
+        return 1;
+      }
+      rows = live.models.map((id) => ({
+        id,
+        name: id,
+        provider: "HallPass",
+        protocols: [],
+        reasoning: false,
+      }));
     }
-    console.log(`${bold(`Available models (${live.models.length}):`)}`);
-    for (const m of live.models) console.log(`  • ${cleanLog(m)}`);
+    if (args.provider) {
+      const p = args.provider.toLowerCase();
+      rows = rows.filter((m) => m.provider.toLowerCase().includes(p));
+    }
+    if (args.search) {
+      const q = args.search.toLowerCase();
+      rows = rows.filter((m) =>
+        `${m.id} ${m.name} ${m.provider}`.toLowerCase().includes(q),
+      );
+    }
+    console.log(`${bold(`Available models (${rows.length}):`)}`);
+    const byProvider = new Map();
+    for (const m of rows) {
+      if (!byProvider.has(m.provider)) byProvider.set(m.provider, []);
+      byProvider.get(m.provider).push(m);
+    }
+    for (const [provider, list] of byProvider.entries()) {
+      console.log(`\n  ${bold(cleanLog(provider))}`);
+      for (const m of list) {
+        const ctx = m.contextLength
+          ? m.contextLength >= 950000
+            ? `${Math.round(m.contextLength / 1000000)}M ctx`
+            : `${Math.round(m.contextLength / 1000)}K ctx`
+          : "";
+        const tags = [m.reasoning ? "reasoning" : "", ctx]
+          .filter(Boolean)
+          .join(", ");
+        console.log(
+          `    • ${cleanLog(m.id)}${m.name && m.name !== m.id ? dim(` (${cleanLog(m.name)})`) : ""}${tags ? dim(` [${tags}]`) : ""}`,
+        );
+      }
+    }
     console.log(
-      dim("\nSwitch models anytime with `npx hallpassai use <model-id>`."),
+      dim(
+        "\nSwitch models & reasoning anytime: `npx hallpassai use <model-id> --reasoning high`",
+      ),
     );
     return 0;
   }
 
   if (args.command === "use") {
     if (!validateAgentFlag()) return 1;
-    if (!args.modelArg || !/^[A-Za-z0-9._:/-]{1,128}$/.test(args.modelArg)) {
-      console.error(
-        red("Provide a valid model ID (e.g. `npx hallpassai use claude-sonnet-4-6`)."),
-      );
-      return 1;
-    }
     const creds = readStoredCredentials();
     const targets =
       args.agent && args.agent !== "all"
@@ -389,15 +488,102 @@ export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
       );
       return 1;
     }
+
+    const first = creds.keys[targets[0]];
+    const catalogModels = await fetchCatalogDetails(
+      { apiBase: first?.apiBase, origin: args.origin },
+      fetcher ? { fetcher } : undefined,
+    );
+
+    let chosenModel = args.modelArg;
+    let chosenReasoning = args.reasoning;
+
+    // Interactive TTY picker when `npx hallpassai use` is invoked with neither model nor --reasoning
+    if (
+      !chosenModel &&
+      !chosenReasoning &&
+      process.stdin.isTTY &&
+      process.stdout.isTTY
+    ) {
+      const liveIds = catalogModels.length
+        ? catalogModels.map((m) => m.id)
+        : (
+            await fetchLiveModels(
+              { apiBase: first.apiBase, token: first.token },
+              fetcher ? { fetcher } : undefined,
+            )
+          ).models;
+      if (liveIds.length) {
+        console.log(bold("\nSelect a HallPass model:"));
+        liveIds.slice(0, 20).forEach((id, idx) => {
+          console.log(`  ${dim(`${idx + 1}.`)} ${cleanLog(id)}`);
+        });
+        const rl = readline.createInterface({
+          input: process.stdin,
+          output: process.stdout,
+        });
+        try {
+          const ans = (
+            await rl.question(
+              `\nModel number or ID [${cleanLog(first.model)}]: `,
+            )
+          ).trim();
+          if (ans) {
+            const num = Number(ans);
+            chosenModel =
+              Number.isInteger(num) && num >= 1 && num <= liveIds.length
+                ? liveIds[num - 1]
+                : ans;
+          } else {
+            chosenModel = first.model;
+          }
+          const rAns = (
+            await rl.question(
+              `Reasoning effort (auto / low / medium / high / max) [${cleanLog(first.reasoning || "auto")}]: `,
+            )
+          )
+            .trim()
+            .toLowerCase();
+          if (rAns && VALID_REASONING_LEVELS.has(rAns)) chosenReasoning = rAns;
+        } finally {
+          rl.close();
+        }
+      }
+    }
+
+    if (!chosenModel && !chosenReasoning) {
+      console.error(
+        red(
+          "Provide a model ID and/or --reasoning flag (e.g. `npx hallpassai use claude-opus-5.5 --reasoning high`).",
+        ),
+      );
+      return 1;
+    }
+    if (chosenModel && !/^[A-Za-z0-9._:/-]{1,128}$/.test(chosenModel)) {
+      console.error(
+        red("Provide a valid model ID (e.g. `npx hallpassai use claude-opus-5.5`)."),
+      );
+      return 1;
+    }
+
     for (const agent of targets) {
-      const res = switchAgentModel(agent, args.modelArg);
+      const targetModel = chosenModel || creds.keys[agent]?.model;
+      const res = switchAgentModel(agent, targetModel, {
+        reasoningEffort: chosenReasoning,
+        catalogModels,
+      });
+      const rLabel =
+        chosenReasoning && chosenReasoning !== "auto" && chosenReasoning !== "none"
+          ? ` (reasoning: ${cleanLog(chosenReasoning)})`
+          : chosenReasoning === "auto" || chosenReasoning === "none"
+            ? " (reasoning: default)"
+            : "";
       console.log(
-        `${green("✓")} Updated ${bold(cleanLog(agent))} → model ${bold(cleanLog(args.modelArg))}`,
+        `${green("✓")} Updated ${bold(cleanLog(agent))} → model ${bold(cleanLog(targetModel))}${rLabel}`,
       );
       for (const f of res.files) console.log(`  ${dim("updated")} ${f}`);
     }
     if (!telemetryDisabled()) {
-      const first = creds.keys[targets[0]];
       await sendCliEvent(
         "cli_model_switched",
         {
@@ -407,7 +593,7 @@ export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
           meta: buildCliMeta({
             cliVersion: pkg.version,
             anonymousId: getAnonymousId(),
-            modelId: args.modelArg,
+            modelId: chosenModel || first?.model,
             configuredHarnesses: targets,
           }),
         },
@@ -444,11 +630,13 @@ export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
         {
           id: "claude-sonnet-4-6",
           name: "Claude Sonnet 4.6",
+          provider: "Anthropic",
           protocols: ["messages", "chat/completions"],
         },
         {
           id: "gpt-5.4",
           name: "GPT-5.4",
+          provider: "OpenAI",
           protocols: ["responses", "chat/completions"],
         },
       ],
@@ -457,7 +645,10 @@ export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
       `${dim("→")} Previewing HallPass setup (pairing code ${parsedCode.code} NOT consumed)…`,
     );
     for (const agent of agents) {
-      const res = configureAgent(agent, previewPayload, { dryRun: true });
+      const res = configureAgent(agent, previewPayload, {
+        dryRun: true,
+        reasoningEffort: args.reasoning,
+      });
       console.log(
         `\n${bold(`[dry-run] ${agent}`)}${res.files.length ? ` (${res.files.join(", ")})` : ""}:`,
       );
@@ -485,11 +676,18 @@ export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
 
   try {
     for (const agent of agents) {
-      const res = configureAgent(agent, claimed, { dryRun: false });
+      const res = configureAgent(agent, claimed, {
+        dryRun: false,
+        reasoningEffort: args.reasoning,
+      });
       if (res.cursorValues) {
         await runCursorInteractive(res.cursorValues);
       } else {
-        console.log(`${green("✓")} Configured ${bold(cleanLog(agent))}`);
+        const rNote =
+          args.reasoning && args.reasoning !== "auto" && args.reasoning !== "none"
+            ? dim(` (reasoning: ${cleanLog(args.reasoning)})`)
+            : "";
+        console.log(`${green("✓")} Configured ${bold(cleanLog(agent))}${rNote}`);
         for (const f of res.files) console.log(`  ${dim("updated")} ${f}`);
         if (res.backup) console.log(`  ${dim("backup")}  ${res.backup}`);
       }

@@ -244,7 +244,10 @@ test("codex adapter preserves [[array_of_tables]] & commented sections and runs 
 
 test("opencode adapter writes opencode.json provider and 0600 auth.json with type:api", () =>
   withTempHome((home) => {
-    configureAgent("opencode", SAMPLE_PAYLOAD, { homeDir: home });
+    configureAgent("opencode", SAMPLE_PAYLOAD, {
+      homeDir: home,
+      reasoningEffort: "high",
+    });
     const cfgPath = path.join(home, ".config", "opencode", "opencode.json");
     const authPath = path.join(home, ".local", "share", "opencode", "auth.json");
     const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
@@ -254,6 +257,13 @@ test("opencode adapter writes opencode.json provider and 0600 auth.json with typ
       context: 128000,
       output: 8192,
     });
+    assert.deepEqual(cfg.provider.hallpass.models["claude-sonnet-4-6"].options, {
+      reasoningEffort: "high",
+    });
+    assert.equal(
+      cfg.provider.hallpass.models["claude-sonnet-4-6"].variants.high.reasoningEffort,
+      "high",
+    );
 
     const auth = JSON.parse(fs.readFileSync(authPath, "utf8"));
     assert.deepEqual(auth.hallpass, { type: "api", key: SAMPLE_PAYLOAD.token });
@@ -388,11 +398,16 @@ test("end-to-end CLI claims pairing code over HTTP, configures tool, verifies /v
 
     assert.equal(await cliMain(["doctor", "--origin", base]), 0);
     assert.equal(await cliMain(["models", "--origin", base]), 0);
-    assert.equal(await cliMain(["use", "gpt-5.4", "--origin", base]), 0);
+    assert.equal(
+      await cliMain(["use", "claude-opus-5.5", "--reasoning", "high", "--origin", base]),
+      0,
+    );
     const updatedClaude = JSON.parse(
       fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"),
     );
-    assert.equal(updatedClaude.env.ANTHROPIC_MODEL, "gpt-5.4");
+    assert.equal(updatedClaude.env.ANTHROPIC_MODEL, "claude-opus-5.5");
+    assert.equal(updatedClaude.effortLevel, "high");
+    assert.equal(updatedClaude.env.CLAUDE_CODE_EFFORT_LEVEL, "high");
 
     assert.equal(await cliMain(["uninstall", "--origin", base]), 0);
     assert.equal(revokedAuth, `Bearer ${SAMPLE_PAYLOAD.token}`);

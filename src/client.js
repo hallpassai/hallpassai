@@ -171,9 +171,16 @@ export function validateClaimPayload(body, resolvedOrigin) {
             typeof m.name === "string"
               ? stripTerminalControls(m.name).slice(0, 128)
               : m.id,
+          provider:
+            typeof m.provider === "string"
+              ? stripTerminalControls(m.provider).slice(0, 64)
+              : "HallPass",
           protocols: Array.isArray(m.protocols)
             ? m.protocols.filter((p) => typeof p === "string")
             : [],
+          ...(Number.isInteger(m.contextLength) && m.contextLength > 0
+            ? { contextLength: m.contextLength }
+            : {}),
         }))
     : [];
   return {
@@ -313,6 +320,52 @@ export async function fetchLiveModels(
     return { ok: true, latencyMs: Date.now() - t0, models };
   } catch {
     return { ok: false, latencyMs: Date.now() - t0, models: [] };
+  }
+}
+
+export async function fetchCatalogDetails(
+  { apiBase, origin },
+  { fetcher = fetch } = {},
+) {
+  try {
+    const safeOrigin = originFromApiBase(apiBase, origin);
+    const res = await fetcher(`${safeOrigin}/api/core/catalog`, {
+      method: "GET",
+      signal: AbortSignal.timeout(10000),
+      redirect: "error",
+    });
+    if (!res.ok) return [];
+    const body = await res.json().catch(() => ({}));
+    return Array.isArray(body?.models)
+      ? body.models
+          .filter(
+            (m) =>
+              m &&
+              typeof m.id === "string" &&
+              /^[A-Za-z0-9._:/-]{1,128}$/.test(m.id),
+          )
+          .map((m) => ({
+            id: m.id,
+            name:
+              typeof m.name === "string"
+                ? stripTerminalControls(m.name).slice(0, 128)
+                : m.id,
+            provider:
+              typeof m.provider === "string"
+                ? stripTerminalControls(m.provider).slice(0, 64)
+                : "HallPass",
+            protocols: Array.isArray(m.protocols)
+              ? m.protocols.filter((p) => typeof p === "string")
+              : [],
+            contextLength:
+              Number.isInteger(m.contextLength) && m.contextLength > 0
+                ? m.contextLength
+                : undefined,
+            reasoning: Boolean(m.reasoning?.supported),
+          }))
+      : [];
+  } catch {
+    return [];
   }
 }
 

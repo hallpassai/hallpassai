@@ -170,7 +170,7 @@ export function readStoredCredentials(homeDir = os.homedir()) {
 
 export function storeCredential(
   harness,
-  { token, apiBase, model },
+  { token, apiBase, model, reasoning = null },
   { homeDir = os.homedir(), useKeychain = process.platform === "darwin" } = {},
 ) {
   if (!/^[a-z0-9-]+$/.test(harness)) {
@@ -202,6 +202,7 @@ export function storeCredential(
     keychain: storedInKeychain,
     apiBase,
     model,
+    ...(reasoning && reasoning !== "auto" ? { reasoning } : {}),
     updatedAt: new Date().toISOString(),
   };
   writePrivateFile(

@@ -143,6 +143,35 @@ function tomlBasicString(val) {
   return out + '"';
 }
 
+const CODEX_HALLPASS_PROFILES = new Set([
+  "profiles.fast",
+  "profiles.balanced",
+  "profiles.deep",
+]);
+
+export const VALID_REASONING_LEVELS = new Set([
+  "auto",
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "max",
+  "xhigh",
+]);
+
+function supportsReasoningId(id = "") {
+  const s = String(id).toLowerCase();
+  return (
+    /^claude-(?:opus|sonnet|fable)/.test(s) ||
+    /^claude-(?:3-7|4|5)/.test(s) ||
+    /^(?:gpt-[56]|o[134]|codex)/.test(s) ||
+    /^(?:deepseek-(?:r1|v3\.2|v4)|qwen3|qwq|kimi-k[23]|gemini-(?:2\.5|3|4)|grok-[34]|glm-[45]|minimax-m2)/.test(
+      s,
+    )
+  );
+}
+
 function stripHallpassFromCodexToml(existingToml, { removeTopLevelProvider = false } = {}) {
   const lines = existingToml
     ? existingToml.replace(/\r\n/g, "\n").split("\n")
@@ -155,7 +184,8 @@ function stripHallpassFromCodexToml(existingToml, { removeTopLevelProvider = fal
       const name = header[2].trim();
       skippingHallpass =
         name === "model_providers.hallpass" ||
-        name.startsWith("model_providers.hallpass.");
+        name.startsWith("model_providers.hallpass.") ||
+        CODEX_HALLPASS_PROFILES.has(name);
     }
     if (!skippingHallpass) kept.push(line);
   }
@@ -171,6 +201,7 @@ function stripHallpassFromCodexToml(existingToml, { removeTopLevelProvider = fal
         i < limit &&
         (/^\s*model_provider\s*=\s*"hallpass"\s*(?:#.*)?$/.test(kept[i]) ||
           (hadHallpassProvider && /^\s*model\s*=/.test(kept[i])) ||
+          (hadHallpassProvider && /^\s*model_reasoning_effort\s*=/.test(kept[i])) ||
           (hadHallpassProvider && /^\s*web_search\s*=\s*"disabled"\s*(?:#.*)?$/.test(kept[i])))
       ) {
         continue;
@@ -186,16 +217,22 @@ function stripHallpassFromCodexToml(existingToml, { removeTopLevelProvider = fal
 
 export function upsertCodexToml(
   existingToml,
-  { model, apiBase, nodePath, helperPath },
+  { model, apiBase, nodePath, helperPath, reasoningEffort = null },
 ) {
   const kept = stripHallpassFromCodexToml(existingToml);
+  const codexEff =
+    reasoningEffort &&
+    ["minimal", "low", "medium", "high", "xhigh"].includes(reasoningEffort)
+      ? reasoningEffort
+      : null;
 
-  // Update or insert top-level `model` and `model_provider` BEFORE the first `[section]` / `[[array]]`.
+  // Update or insert top-level `model`, `model_provider`, and optional `model_reasoning_effort` BEFORE the first `[section]` / `[[array]]`.
   const firstSectionIdx = kept.findIndex((l) => TOML_HEADER_RE.test(l));
   const limit = firstSectionIdx === -1 ? kept.length : firstSectionIdx;
   let sawModel = false;
   let sawProvider = false;
   let sawWebSearch = false;
+  let sawReasoning = false;
   for (let i = 0; i < limit; i++) {
     if (/^\s*model\s*=/.test(kept[i])) {
       kept[i] = `model = ${tomlBasicString(model)}`;
@@ -206,11 +243,22 @@ export function upsertCodexToml(
     } else if (/^\s*web_search\s*=/.test(kept[i])) {
       kept[i] = `web_search = "disabled"`;
       sawWebSearch = true;
+    } else if (/^\s*model_reasoning_effort\s*=/.test(kept[i])) {
+      if (codexEff) {
+        kept[i] = `model_reasoning_effort = ${tomlBasicString(codexEff)}`;
+        sawReasoning = true;
+      } else {
+        kept.splice(i, 1);
+        i--;
+      }
     }
   }
   const topInserts = [];
   if (!sawModel) topInserts.push(`model = ${tomlBasicString(model)}`);
   if (!sawProvider) topInserts.push(`model_provider = "hallpass"`);
+  if (codexEff && !sawReasoning) {
+    topInserts.push(`model_reasoning_effort = ${tomlBasicString(codexEff)}`);
+  }
   if (!sawWebSearch) topInserts.push(`web_search = "disabled"`);
   if (topInserts.length) {
     kept.splice(
@@ -233,6 +281,18 @@ export function upsertCodexToml(
     `command = ${tomlBasicString(nodePath)}`,
     `args = [${tomlBasicString(helperPath)}, "codex"]`,
     `timeout_ms = 3000`,
+    "",
+    "[profiles.fast]",
+    `model = ${tomlBasicString(model)}`,
+    `model_reasoning_effort = "low"`,
+    "",
+    "[profiles.balanced]",
+    `model = ${tomlBasicString(model)}`,
+    `model_reasoning_effort = "medium"`,
+    "",
+    "[profiles.deep]",
+    `model = ${tomlBasicString(model)}`,
+    `model_reasoning_effort = "high"`,
     "",
   ];
   return [...kept, ...block].join("\n");
@@ -322,21 +382,53 @@ export function configureAgent(
     dryRun = false,
     nodePath = process.execPath,
     shell = process.env.SHELL || "/bin/zsh",
+    reasoningEffort = null,
   } = {},
 ) {
   const { token, apiBase, model, models = [] } = payload;
   const effectiveToken = dryRun ? "hp_live_••••••••" : token;
   const anthropicBase = apiBase.replace(/\/v1\/?$/, "");
+  const normEffort =
+    typeof reasoningEffort === "string" &&
+    VALID_REASONING_LEVELS.has(reasoningEffort.toLowerCase()) &&
+    reasoningEffort.toLowerCase() !== "auto" &&
+    reasoningEffort.toLowerCase() !== "none"
+      ? reasoningEffort.toLowerCase()
+      : null;
 
   if (agent === "claude-code") {
     const settingsPath = path.join(homeDir, ".claude", "settings.json");
     const current = readJsonSafe(settingsPath);
+    const claudeModels = models.filter(
+      (m) =>
+        m.protocols?.includes("messages") &&
+        (m.provider === "Anthropic" || /^claude[-_]/i.test(m.id)),
+    );
+    const chosenClaude =
+      claudeModels.find((m) => m.id === model)?.id ||
+      models.find((m) => m.id === model && m.protocols?.includes("messages"))
+        ?.id ||
+      claudeModels[0]?.id ||
+      model;
+    const defaultOpus = claudeModels.find((m) => /opus/i.test(m.id))?.id;
+    const defaultSonnet = claudeModels.find((m) => /sonnet/i.test(m.id))?.id;
+    const defaultHaiku = claudeModels.find((m) => /haiku/i.test(m.id))?.id;
+    const claudeEffort =
+      normEffort && ["low", "medium", "high", "max"].includes(normEffort)
+        ? normEffort
+        : null;
+
     const hasNonHallpassClaudeKeys = (() => {
       const probe = structuredClone(current);
+      delete probe.effortLevel;
       if (probe.env && typeof probe.env === "object") {
         delete probe.env.ANTHROPIC_BASE_URL;
         delete probe.env.ANTHROPIC_AUTH_TOKEN;
         delete probe.env.ANTHROPIC_MODEL;
+        delete probe.env.ANTHROPIC_DEFAULT_OPUS_MODEL;
+        delete probe.env.ANTHROPIC_DEFAULT_SONNET_MODEL;
+        delete probe.env.ANTHROPIC_DEFAULT_HAIKU_MODEL;
+        delete probe.env.CLAUDE_CODE_EFFORT_LEVEL;
         if (probe.env.ANTHROPIC_API_KEY === "") delete probe.env.ANTHROPIC_API_KEY;
         delete probe.env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY;
         delete probe.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
@@ -344,21 +436,36 @@ export function configureAgent(
       }
       return Object.keys(probe).length > 0;
     })();
+    const nextEnv = {
+      ...(current.env && typeof current.env === "object" ? current.env : {}),
+      ANTHROPIC_BASE_URL: anthropicBase,
+      ANTHROPIC_AUTH_TOKEN: effectiveToken,
+      ANTHROPIC_API_KEY: "",
+      ANTHROPIC_MODEL: chosenClaude,
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "8192",
+      CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: "1",
+      ...(defaultOpus ? { ANTHROPIC_DEFAULT_OPUS_MODEL: defaultOpus } : {}),
+      ...(defaultSonnet ? { ANTHROPIC_DEFAULT_SONNET_MODEL: defaultSonnet } : {}),
+      ...(defaultHaiku ? { ANTHROPIC_DEFAULT_HAIKU_MODEL: defaultHaiku } : {}),
+    };
+    if (claudeEffort) nextEnv.CLAUDE_CODE_EFFORT_LEVEL = claudeEffort;
+    else delete nextEnv.CLAUDE_CODE_EFFORT_LEVEL;
+
     const next = {
       ...current,
-      env: {
-        ...(current.env && typeof current.env === "object" ? current.env : {}),
-        ANTHROPIC_BASE_URL: anthropicBase,
-        ANTHROPIC_AUTH_TOKEN: effectiveToken,
-        ANTHROPIC_API_KEY: "",
-        ANTHROPIC_MODEL: model,
-        CLAUDE_CODE_MAX_OUTPUT_TOKENS: "8192",
-        CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: "1",
-      },
+      ...(claudeEffort ? { effortLevel: claudeEffort } : {}),
+      env: nextEnv,
     };
+    if (!claudeEffort && Object.hasOwn(next, "effortLevel") && !hasNonHallpassClaudeKeys) {
+      delete next.effortLevel;
+    }
     const content = JSON.stringify(next, null, 2) + "\n";
     if (!dryRun) {
-      storeCredential("claude-code", { token, apiBase, model }, { homeDir });
+      storeCredential(
+        "claude-code",
+        { token, apiBase, model: chosenClaude, reasoning: claudeEffort },
+        { homeDir },
+      );
       const backup = hasNonHallpassClaudeKeys
         ? backupOnce(settingsPath, { secret: true })
         : null;
@@ -367,7 +474,7 @@ export function configureAgent(
         agent,
         files: [settingsPath],
         backup,
-        nextStep: "Run `claude` in this terminal and send your first prompt.",
+        nextStep: "Run `claude` in this terminal (switch models & effort anytime with `/model` and `/effort`).",
       };
     }
     return { agent, files: [settingsPath], preview: content };
@@ -380,19 +487,36 @@ export function configureAgent(
       ? fs.readFileSync(configPath, "utf8")
       : "";
     const helperPath = helperScriptPath(homeDir);
+    const openAiResponses = models.filter(
+      (m) =>
+        m.protocols?.includes("responses") &&
+        (m.provider === "OpenAI" || /^(?:gpt-|o[134]|codex)/i.test(m.id)),
+    );
     const compatible =
       models.find((m) => m.id === model && m.protocols?.includes("responses"))
         ?.id ||
+      openAiResponses[0]?.id ||
       models.find((m) => m.protocols?.includes("responses"))?.id ||
       model;
+    const codexEffort =
+      normEffort && ["minimal", "low", "medium", "high", "xhigh"].includes(normEffort)
+        ? normEffort
+        : normEffort === "max"
+          ? "xhigh"
+          : null;
     const content = upsertCodexToml(existing, {
       model: compatible,
       apiBase,
       nodePath,
       helperPath,
+      reasoningEffort: codexEffort,
     });
     if (!dryRun) {
-      storeCredential("codex", { token, apiBase, model: compatible }, { homeDir });
+      storeCredential(
+        "codex",
+        { token, apiBase, model: compatible, reasoning: codexEffort },
+        { homeDir },
+      );
       const nonHallpassToml = existing
         ? stripHallpassFromCodexToml(existing, { removeTopLevelProvider: true }).trim()
         : "";
@@ -404,7 +528,7 @@ export function configureAgent(
         agent,
         files: [configPath, helperPath],
         backup,
-        nextStep: "Run `codex` in this terminal and send your first prompt.",
+        nextStep: "Run `codex` (or `codex -p deep` / `codex -p fast` for reasoning profiles).",
       };
     }
     return { agent, files: [configPath], preview: content };
@@ -422,6 +546,12 @@ export function configureAgent(
       chatModels.find((m) => m.id === model)?.id ||
       chatModels[0]?.id ||
       model;
+    const ocEffort =
+      normEffort && ["low", "medium", "high"].includes(normEffort)
+        ? normEffort
+        : normEffort === "max" || normEffort === "xhigh"
+          ? "high"
+          : null;
     const modelEntries = Object.create(null);
     for (const m of chatModels.length
       ? chatModels
@@ -432,9 +562,27 @@ export function configureAgent(
         m.id === "prototype"
       )
         continue;
+      const canReason = supportsReasoningId(m.id);
+      const ctxLimit =
+        Number.isInteger(m.contextLength) && m.contextLength > 0
+          ? m.contextLength
+          : 128000;
       modelEntries[m.id] = {
         name: m.name || m.id,
-        limit: { context: 128000, output: 8192 },
+        ...(canReason ? { reasoning: true, tool_call: true } : {}),
+        limit: { context: ctxLimit, output: 8192 },
+        ...(ocEffort && m.id === chosenModel
+          ? { options: { reasoningEffort: ocEffort } }
+          : {}),
+        ...(canReason
+          ? {
+              variants: {
+                low: { reasoningEffort: "low" },
+                medium: { reasoningEffort: "medium" },
+                high: { reasoningEffort: "high" },
+              },
+            }
+          : {}),
       };
     }
 
@@ -470,7 +618,11 @@ export function configureAgent(
     const authContent = JSON.stringify(nextAuth, null, 2) + "\n";
 
     if (!dryRun) {
-      storeCredential("opencode", { token, apiBase, model: chosenModel }, { homeDir });
+      storeCredential(
+        "opencode",
+        { token, apiBase, model: chosenModel, reasoning: ocEffort },
+        { homeDir },
+      );
       const hasOtherProvider = Boolean(
         Object.keys(currentCfg).some((k) => !["$schema", "model", "provider"].includes(k)) ||
           Object.keys(currentCfg.provider || {}).some((p) => p !== "hallpass") ||
@@ -606,10 +758,15 @@ export function undoAgent(
       const fp = path.join(homeDir, ".claude", "settings.json");
       if (!restoreBak(fp, { secret: true }) && fs.existsSync(fp)) {
         const cur = readJsonSafe(fp);
+        delete cur.effortLevel;
         if (cur.env && typeof cur.env === "object") {
           delete cur.env.ANTHROPIC_BASE_URL;
           delete cur.env.ANTHROPIC_AUTH_TOKEN;
           delete cur.env.ANTHROPIC_MODEL;
+          delete cur.env.ANTHROPIC_DEFAULT_OPUS_MODEL;
+          delete cur.env.ANTHROPIC_DEFAULT_SONNET_MODEL;
+          delete cur.env.ANTHROPIC_DEFAULT_HAIKU_MODEL;
+          delete cur.env.CLAUDE_CODE_EFFORT_LEVEL;
           if (cur.env.ANTHROPIC_API_KEY === "") delete cur.env.ANTHROPIC_API_KEY;
           delete cur.env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY;
           delete cur.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
@@ -814,7 +971,12 @@ export function inspectAgentConfig(
 export function switchAgentModel(
   agent,
   newModel,
-  { homeDir = os.homedir(), shell = process.env.SHELL || "/bin/zsh" } = {},
+  {
+    homeDir = os.homedir(),
+    shell = process.env.SHELL || "/bin/zsh",
+    reasoningEffort = null,
+    catalogModels = null,
+  } = {},
 ) {
   const creds = readStoredCredentials(homeDir);
   const entry = creds.keys?.[agent];
@@ -823,20 +985,29 @@ export function switchAgentModel(
       `${agent} is not configured yet. Pair it first at https://app.hallpassai.com/start.html#connect`,
     );
   }
+  const effectiveModel = newModel || entry.model;
+  const effectiveReasoning =
+    reasoningEffort !== null && reasoningEffort !== undefined
+      ? reasoningEffort
+      : entry.reasoning || null;
+  const modelsList =
+    Array.isArray(catalogModels) && catalogModels.length
+      ? catalogModels
+      : [
+          {
+            id: effectiveModel,
+            name: effectiveModel,
+            protocols: ["messages", "responses", "chat/completions"],
+          },
+        ];
   return configureAgent(
     agent,
     {
       token: entry.token,
       apiBase: entry.apiBase,
-      model: newModel,
-      models: [
-        {
-          id: newModel,
-          name: newModel,
-          protocols: ["messages", "responses", "chat/completions"],
-        },
-      ],
+      model: effectiveModel,
+      models: modelsList,
     },
-    { homeDir, shell, dryRun: false },
+    { homeDir, shell, dryRun: false, reasoningEffort: effectiveReasoning },
   );
 }

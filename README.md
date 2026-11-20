@@ -13,7 +13,7 @@
   <a href="https://hallpassai.com"><img src="https://img.shields.io/badge/gateway-hallpassai.com-181916" alt="hallpassai.com"></a>
 </p>
 
-Configure your coding tools to use [HallPass](https://hallpassai.com) in a single command — no manual API key pasting or shell reload required.
+Configure your coding tools to use [HallPass](https://hallpassai.com) in a single command — including model selection, reasoning effort levels, diagnostics, and clean uninstall.
 
 ## Quick start
 
@@ -23,37 +23,38 @@ Generate a 10-minute pairing code on **[app.hallpassai.com/start.html#connect](h
 npx hallpassai@latest HP-XXXX-XXXX
 ```
 
-## Supported tools
+## Supported tools & model ecosystems
 
-| Tool | What `npx hallpassai` configures |
+| Tool | Models & reasoning support |
 |---|---|
-| **Claude Code** | Updates `~/.claude/settings.json` (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, gateway model discovery) |
-| **Codex CLI** | Configures `[model_providers.hallpass]` (`wire_api = "responses"`) + credential helper in `~/.codex/config.toml` |
-| **OpenCode** | Registers the `hallpass` provider in `~/.config/opencode/opencode.json` + stores key in `~/.local/share/opencode/auth.json` |
-| **Copilot CLI** | Writes `~/.config/hallpass/copilot.env` (`0600`) and adds an idempotent `# >>> hallpass >>>` block to your shell profile |
-| **Cursor** | Steps through copying your API key, Base URL, and Model ID directly to your clipboard |
+| **Claude Code** | Anthropic Claude models (`Opus`, `Sonnet`, `Haiku`) · Sets `effortLevel` + `ANTHROPIC_DEFAULT_*_MODEL` aliases in `~/.claude/settings.json` (`/model` & `/effort` ready) |
+| **Codex CLI** | OpenAI GPT & Codex models · Configures `[model_providers.hallpass]` + `fast`, `balanced`, and `deep` reasoning profiles in `~/.codex/config.toml` |
+| **OpenCode** | All 130+ HallPass models (Claude, GPT, DeepSeek, Gemini, Qwen, Kimi…) · Registers `low` / `medium` / `high` reasoning variants (`Ctrl+T` & `/models` ready) |
+| **Copilot CLI** | All OpenAI-compatible HallPass models · Writes `~/.config/hallpass/copilot.env` (`0600`) + idempotent shell profile block |
+| **Cursor** | All 130+ HallPass models · Copies API Key, Base URL, and Model ID directly to your clipboard |
 
 Every modified configuration file is backed up to `<file>.hallpass.bak` first.
 
 ## Commands & flags
 
 ```bash
-# Pair and configure a tool (or all detected tools)
+# Pair and configure (optionally set default reasoning depth: low, medium, high, max)
 npx hallpassai@latest HP-XXXX-XXXX
+npx hallpassai@latest HP-XXXX-XXXX --reasoning high
 
-# Preview file changes locally without consuming the pairing code or modifying disk
-npx hallpassai@latest HP-XXXX-XXXX --dry-run
+# Browse live models grouped by provider or filter by search query
+npx hallpassai@latest models
+npx hallpassai@latest models --provider Anthropic
+npx hallpassai@latest models --search deepseek
+
+# Switch models and/or reasoning depth anytime without re-pairing
+npx hallpassai@latest use claude-opus-5.5 --reasoning high
+npx hallpassai@latest use --reasoning medium
+npx hallpassai@latest use   # interactive TTY model + reasoning picker
 
 # Check configured tools, config integrity, and gateway latency (uses 0 credits)
 npx hallpassai@latest status
 npx hallpassai@latest doctor
-
-# List live models and switch your configured tool(s) to another model
-npx hallpassai@latest models
-npx hallpassai@latest use claude-sonnet-4-6
-
-# Restore backups (local config revert)
-npx hallpassai@latest undo [--agent claude-code]
 
 # Full uninstall & cleanup: revokes server API key(s), restores .hallpass.bak backups,
 # cleans shell profiles & macOS Keychain, and removes ~/.config/hallpass
