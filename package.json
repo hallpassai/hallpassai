@@ -1,0 +1,45 @@
+{
+  "name": "hallpassai",
+  "version": "0.1.1",
+  "description": "One-command setup connector for HallPass AI API gateway (Claude Code, Codex, OpenCode, Copilot CLI, Cursor).",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "hallpassai": "./bin/cli.js"
+  },
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hallpassai/hallpassai.git"
+  },
+  "homepage": "https://hallpassai.com",
+  "keywords": [
+    "hallpass",
+    "ai-gateway",
+    "claude-code",
+    "codex",
+    "opencode",
+    "copilot",
+    "cursor",
+    "llm"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  },
+  "bugs": {
+    "url": "https://github.com/hallpassai/hallpassai/issues"
+  }
+}
