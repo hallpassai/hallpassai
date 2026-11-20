@@ -38,6 +38,17 @@ function readJsonSafe(filePath) {
   return JSON.parse(raw);
 }
 
+function resolveOpencodeDirs(homeDir, env = process.env) {
+  const useEnvXdg = homeDir === os.homedir();
+  const configDir = useEnvXdg && env.XDG_CONFIG_HOME
+    ? path.join(env.XDG_CONFIG_HOME, "opencode")
+    : path.join(homeDir, ".config", "opencode");
+  const dataDir = useEnvXdg && env.XDG_DATA_HOME
+    ? path.join(env.XDG_DATA_HOME, "opencode")
+    : path.join(homeDir, ".local", "share", "opencode");
+  return { configDir, dataDir };
+}
+
 export function detectInstalledAgents(homeDir = os.homedir(), env = process.env) {
   const found = [];
   const hasCmd = (cmd) => {
@@ -52,6 +63,7 @@ export function detectInstalledAgents(homeDir = os.homedir(), env = process.env)
   if (fs.existsSync(path.join(homeDir, ".codex")) || hasCmd("codex"))
     found.push("codex");
   if (
+    fs.existsSync(resolveOpencodeDirs(homeDir, env).configDir) ||
     fs.existsSync(path.join(homeDir, ".config", "opencode")) ||
     hasCmd("opencode")
   )
@@ -231,12 +243,7 @@ export function configureAgent(
   }
 
   if (agent === "opencode") {
-    const configDir = process.env.XDG_CONFIG_HOME
-      ? path.join(process.env.XDG_CONFIG_HOME, "opencode")
-      : path.join(homeDir, ".config", "opencode");
-    const dataDir = process.env.XDG_DATA_HOME
-      ? path.join(process.env.XDG_DATA_HOME, "opencode")
-      : path.join(homeDir, ".local", "share", "opencode");
+    const { configDir, dataDir } = resolveOpencodeDirs(homeDir);
     const configPath = path.join(configDir, "opencode.json");
     const authPath = path.join(dataDir, "auth.json");
 
@@ -409,12 +416,7 @@ export function undoAgent(
       const fp = path.join(homeDir, ".codex", "config.toml");
       restoreBak(fp);
     } else if (a === "opencode") {
-      const cfgDir = process.env.XDG_CONFIG_HOME
-        ? path.join(process.env.XDG_CONFIG_HOME, "opencode")
-        : path.join(homeDir, ".config", "opencode");
-      const dataDir = process.env.XDG_DATA_HOME
-        ? path.join(process.env.XDG_DATA_HOME, "opencode")
-        : path.join(homeDir, ".local", "share", "opencode");
+      const { configDir: cfgDir, dataDir } = resolveOpencodeDirs(homeDir);
       restoreBak(path.join(cfgDir, "opencode.json"));
       restoreBak(path.join(dataDir, "auth.json"));
     } else if (a === "copilot") {

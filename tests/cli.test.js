@@ -270,6 +270,8 @@ test("packed npm tarball extracts cleanly and runs real CLI subprocess across al
       SHELL: "/bin/zsh",
       HALLPASS_CONFIG_DIR: path.join(home, ".config", "hallpass"),
       HALLPASS_DISABLE_KEYCHAIN: "1",
+      XDG_CONFIG_HOME: path.join(home, ".config"),
+      XDG_DATA_HOME: path.join(home, ".local", "share"),
     };
     const base = `http://127.0.0.1:${server.address().port}`;
     await execFileAsync(process.execPath, [binPath, "HPL-ABCD-2345", "--agent", "all", "--origin", base], { env });
