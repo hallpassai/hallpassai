@@ -16,6 +16,7 @@ import {
 import {
   normalizeCode,
   resolveOrigin,
+  isValidModelId,
   claimCode,
   fetchLiveModels,
   fetchCatalogDetails,
@@ -68,7 +69,8 @@ ${bold("Usage:")}
   npx hallpassai@latest uninstall [--agent <name>] [--keep-keys]
 
 ${bold("Options:")}
-  -r, --reasoning <lvl>  Set reasoning depth (auto, low, medium, high, max, xhigh)
+  -r, --reasoning <lvl>  Set reasoning depth (auto, none, minimal, low, medium, high, max, xhigh)
+  -m, --model <id>       Explicit model ID for \`use\`
   --agent <name>         Target a specific tool (${SUPPORTED_AGENTS.join(", ")})
   --provider <name>      Filter \`models\` list by provider (e.g. Anthropic, OpenAI, DeepSeek)
   --search <query>       Search \`models\` list by name or ID
@@ -120,8 +122,21 @@ export function parseArgs(argv) {
       continue;
     }
     if (a.startsWith("--agent=")) {
-      out.agent = a.slice(8);
+      out.agent = a.slice(a.indexOf("=") + 1);
       if (!out.agent) throw new Error("Missing value for --agent.");
+      continue;
+    }
+    if (a === "-m" || a === "--model") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        throw new Error(`Missing value for ${a}.`);
+      }
+      out.modelArg = next;
+      continue;
+    }
+    if (a.startsWith("--model=")) {
+      out.modelArg = a.slice(a.indexOf("=") + 1);
+      if (!out.modelArg) throw new Error("Missing value for --model.");
       continue;
     }
     if (a === "-r" || a === "--reasoning" || a === "--effort") {
@@ -133,7 +148,7 @@ export function parseArgs(argv) {
       continue;
     }
     if (a.startsWith("--reasoning=") || a.startsWith("--effort=")) {
-      out.reasoning = a.split("=")[1]?.toLowerCase() || "";
+      out.reasoning = a.slice(a.indexOf("=") + 1).toLowerCase();
       if (!out.reasoning) throw new Error("Missing value for --reasoning.");
       continue;
     }
@@ -146,7 +161,7 @@ export function parseArgs(argv) {
       continue;
     }
     if (a.startsWith("--provider=")) {
-      out.provider = a.slice(11);
+      out.provider = a.slice(a.indexOf("=") + 1);
       if (!out.provider) throw new Error("Missing value for --provider.");
       continue;
     }
@@ -159,7 +174,7 @@ export function parseArgs(argv) {
       continue;
     }
     if (a.startsWith("--search=")) {
-      out.search = a.slice(9);
+      out.search = a.slice(a.indexOf("=") + 1);
       if (!out.search) throw new Error("Missing value for --search.");
       continue;
     }
@@ -172,9 +187,12 @@ export function parseArgs(argv) {
       continue;
     }
     if (a.startsWith("--origin=")) {
-      out.origin = a.slice(9);
+      out.origin = a.slice(a.indexOf("=") + 1);
       if (!out.origin) throw new Error("Missing value for --origin.");
       continue;
+    }
+    if (a.startsWith("-")) {
+      throw new Error(`Unknown option: ${a}`);
     }
     if (!out.command) {
       if (UNINSTALL_ALIASES.has(a)) {
@@ -192,8 +210,8 @@ export function parseArgs(argv) {
       out.modelArg = a;
       continue;
     }
-    if (out.command === "models" && !out.search) {
-      out.search = a;
+    if (out.command === "models") {
+      out.search = out.search ? `${out.search} ${a}` : a;
       continue;
     }
     if (!out.code) out.code = a;
@@ -251,7 +269,7 @@ export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
   if (args.reasoning && !VALID_REASONING_LEVELS.has(args.reasoning)) {
     console.error(
       red(
-        `Invalid --reasoning "${cleanLog(args.reasoning)}". Choose one of: auto, low, medium, high, max, xhigh`,
+        `Invalid --reasoning "${cleanLog(args.reasoning)}". Choose one of: auto, none, minimal, low, medium, high, max, xhigh`,
       ),
     );
     return 1;
@@ -340,6 +358,7 @@ export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
   }
 
   if (args.command === "status" || args.command === "doctor") {
+    if (!validateAgentFlag()) return 1;
     const creds = readStoredCredentials();
     const entries = Object.entries(creds.keys || {}).filter(
       ([k]) => !args.agent || args.agent === "all" || k === args.agent,
@@ -359,13 +378,17 @@ export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
         fetcher ? { fetcher } : undefined,
       );
       const disk = inspectAgentConfig(agent);
+      const activeModel = disk.diskModel || info.model;
+      const activeReasoning = disk.diskReasoning ?? info.reasoning ?? null;
       const modelOk =
-        !live.models.length || live.models.includes(info.model);
+        !live.models.length || live.models.includes(activeModel);
       const healthy = live.ok && disk.ok && modelOk;
       if (!healthy) allHealthy = false;
-      const reasoningBadge = info.reasoning ? ` · reasoning: ${cleanLog(info.reasoning)}` : "";
+      const reasoningBadge = activeReasoning
+        ? ` · reasoning: ${cleanLog(activeReasoning)}`
+        : "";
       console.log(
-        `${healthy ? green("✓") : red("✗")} ${bold(cleanLog(agent))} — model: ${cleanLog(info.model)}${reasoningBadge} · endpoint: ${cleanLog(info.apiBase)} · key: ${live.ok ? `active (${live.latencyMs}ms)` : "invalid or unreachable"}`,
+        `${healthy ? green("✓") : red("✗")} ${bold(cleanLog(agent))} — model: ${cleanLog(activeModel)}${reasoningBadge} · endpoint: ${cleanLog(info.apiBase)} · key: ${live.ok ? `active (${live.latencyMs}ms)` : "invalid or unreachable"}`,
       );
       if (args.command === "doctor" || !disk.ok || !modelOk) {
         console.log(
@@ -374,7 +397,7 @@ export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
         console.log(`  ${dim("endpoint")} ${cleanLog(info.apiBase)}`);
         if (live.ok && !modelOk) {
           console.log(
-            `  ${dim("warning")} Model "${cleanLog(info.model)}" not in live catalog (${live.models.slice(0, 4).map(cleanLog).join(", ")}). Switch with \`npx hallpassai use <model>\`.`,
+            `  ${dim("warning")} Model "${cleanLog(activeModel)}" not in live catalog (${live.models.slice(0, 4).map(cleanLog).join(", ")}). Switch with \`npx hallpassai use <model>\`.`,
           );
         }
       }
@@ -400,48 +423,97 @@ export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
     return allHealthy ? 0 : 1;
   }
 
+  const isModelCompatibleWithAgent = (agent, modelObj, catalogList = []) => {
+    if (!modelObj) return true;
+    const reqProto =
+      agent === "claude-code"
+        ? "messages"
+        : agent === "codex"
+          ? "responses"
+          : "chat/completions";
+    if (
+      Array.isArray(modelObj.protocols) &&
+      modelObj.protocols.length > 0 &&
+      !modelObj.protocols.includes(reqProto)
+    ) {
+      return false;
+    }
+    if (agent === "claude-code") {
+      const hasNativeClaude = catalogList.some(
+        (m) =>
+          m.protocols?.includes("messages") &&
+          (m.provider === "Anthropic" || /^claude[-_]/i.test(m.id)),
+      );
+      if (
+        hasNativeClaude &&
+        modelObj.provider !== "Anthropic" &&
+        !/^claude[-_]/i.test(modelObj.id)
+      ) {
+        return false;
+      }
+    }
+    if (agent === "codex") {
+      const hasNativeOpenAi = catalogList.some(
+        (m) =>
+          m.protocols?.includes("responses") &&
+          (m.provider === "OpenAI" ||
+            /^(?:gpt-|openai-gpt-|o[134]|codex)/i.test(m.id)),
+      );
+      if (
+        hasNativeOpenAi &&
+        modelObj.provider !== "OpenAI" &&
+        !/^(?:gpt-|openai-gpt-|o[134]|codex)/i.test(modelObj.id)
+      ) {
+        return false;
+      }
+    }
+    return true;
+  };
+
   if (args.command === "models") {
+    if (!validateAgentFlag()) return 1;
     const creds = readStoredCredentials();
     const first = Object.values(creds.keys || {})[0];
-    if (!first?.token || !first?.apiBase) {
-      console.error(
-        red(
-          "No active HallPass tool configured yet. Pair first at https://app.hallpassai.com/start.html#connect",
-        ),
-      );
-      return 1;
-    }
     const detailed = await fetchCatalogDetails(
-      { apiBase: first.apiBase, origin: args.origin },
+      {
+        apiBase: first?.apiBase || null,
+        origin: args.origin || (!first?.apiBase ? resolveOrigin("HP") : null),
+      },
       fetcher ? { fetcher } : undefined,
     );
     let rows = detailed;
-    if (!rows.length) {
+    if (!rows.length && first?.token && first?.apiBase) {
       const live = await fetchLiveModels(
         { apiBase: first.apiBase, token: first.token },
         fetcher ? { fetcher } : undefined,
       );
-      if (!live.ok) {
-        console.error(red("Could not reach HallPass gateway with stored key."));
-        return 1;
+      if (live.ok) {
+        rows = live.models.map((id) => ({
+          id,
+          name: id,
+          provider: "HallPass",
+          protocols: [],
+          reasoning: false,
+        }));
       }
-      rows = live.models.map((id) => ({
-        id,
-        name: id,
-        provider: "HallPass",
-        protocols: [],
-        reasoning: false,
-      }));
+    }
+    if (!rows.length) {
+      console.error(red("Could not load HallPass model catalog."));
+      return 1;
+    }
+    if (args.agent && args.agent !== "all") {
+      rows = rows.filter((m) => isModelCompatibleWithAgent(args.agent, m, detailed));
     }
     if (args.provider) {
       const p = args.provider.toLowerCase();
       rows = rows.filter((m) => m.provider.toLowerCase().includes(p));
     }
     if (args.search) {
-      const q = args.search.toLowerCase();
-      rows = rows.filter((m) =>
-        `${m.id} ${m.name} ${m.provider}`.toLowerCase().includes(q),
-      );
+      const terms = args.search.toLowerCase().trim().split(/\s+/).filter(Boolean);
+      rows = rows.filter((m) => {
+        const hay = `${m.id} ${m.name} ${m.provider}`.toLowerCase();
+        return terms.every((t) => hay.includes(t));
+      });
     }
     console.log(`${bold(`Available models (${rows.length}):`)}`);
     const byProvider = new Map();
@@ -476,10 +548,10 @@ export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
   if (args.command === "use") {
     if (!validateAgentFlag()) return 1;
     const creds = readStoredCredentials();
-    const targets =
-      args.agent && args.agent !== "all"
-        ? [args.agent]
-        : Object.keys(creds.keys || {});
+    const explicitAgent = Boolean(args.agent && args.agent !== "all");
+    const targets = explicitAgent
+      ? [args.agent]
+      : Object.keys(creds.keys || {});
     if (!targets.length) {
       console.error(
         red(
@@ -505,8 +577,14 @@ export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
       process.stdin.isTTY &&
       process.stdout.isTTY
     ) {
-      const liveIds = catalogModels.length
-        ? catalogModels.map((m) => m.id)
+      const scopedCatalog =
+        explicitAgent && catalogModels.length
+          ? catalogModels.filter((m) =>
+              isModelCompatibleWithAgent(args.agent, m, catalogModels),
+            )
+          : catalogModels;
+      const liveIds = scopedCatalog.length
+        ? scopedCatalog.map((m) => m.id)
         : (
             await fetchLiveModels(
               { apiBase: first.apiBase, token: first.token },
@@ -514,8 +592,13 @@ export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
             )
           ).models;
       if (liveIds.length) {
-        console.log(bold("\nSelect a HallPass model:"));
-        liveIds.slice(0, 20).forEach((id, idx) => {
+        const previewCount = Math.min(25, liveIds.length);
+        console.log(
+          bold(
+            `\nSelect a HallPass model${liveIds.length > previewCount ? ` (showing ${previewCount} of ${liveIds.length} — or type any model ID)` : ""}:`,
+          ),
+        );
+        liveIds.slice(0, previewCount).forEach((id, idx) => {
           console.log(`  ${dim(`${idx + 1}.`)} ${cleanLog(id)}`);
         });
         const rl = readline.createInterface({
@@ -525,16 +608,16 @@ export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
         try {
           const ans = (
             await rl.question(
-              `\nModel number or ID [${cleanLog(first.model)}]: `,
+              `\nModel number or ID [keep ${targets.length > 1 ? "current per tool" : cleanLog(first.model)}]: `,
             )
           ).trim();
           if (ans) {
             const num = Number(ans);
             chosenModel =
-              Number.isInteger(num) && num >= 1 && num <= liveIds.length
+              Number.isInteger(num) && num >= 1 && num <= previewCount
                 ? liveIds[num - 1]
                 : ans;
-          } else {
+          } else if (targets.length === 1) {
             chosenModel = first.model;
           }
           const rAns = (
@@ -544,7 +627,17 @@ export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
           )
             .trim()
             .toLowerCase();
-          if (rAns && VALID_REASONING_LEVELS.has(rAns)) chosenReasoning = rAns;
+          if (rAns) {
+            if (!VALID_REASONING_LEVELS.has(rAns)) {
+              console.error(
+                red(
+                  `Invalid reasoning effort "${cleanLog(rAns)}". Choose auto, none, minimal, low, medium, high, max, or xhigh.`,
+                ),
+              );
+              return 1;
+            }
+            chosenReasoning = rAns;
+          }
         } finally {
           rl.close();
         }
@@ -559,29 +652,93 @@ export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
       );
       return 1;
     }
-    if (chosenModel && !/^[A-Za-z0-9._:/-]{1,128}$/.test(chosenModel)) {
+    if (chosenModel && !isValidModelId(chosenModel)) {
       console.error(
         red("Provide a valid model ID (e.g. `npx hallpassai use claude-opus-5.5`)."),
       );
       return 1;
     }
 
+    const catalogMatch =
+      chosenModel && catalogModels.length
+        ? catalogModels.find((m) => m.id === chosenModel)
+        : null;
+    if (chosenModel && catalogModels.length && !catalogMatch) {
+      const suggestions = catalogModels
+        .filter((m) => m.id.includes(chosenModel.toLowerCase()))
+        .slice(0, 4)
+        .map((m) => m.id);
+      console.error(
+        red(
+          `Unknown model "${cleanLog(chosenModel)}".${suggestions.length ? ` Did you mean: ${suggestions.map(cleanLog).join(", ")}?` : " Run `npx hallpassai models` to browse available models."}`,
+        ),
+      );
+      return 1;
+    }
+
+    const inferOfflineCompatible = (agent, modelId) => {
+      if (agent === "claude-code") return /^claude[-_]/i.test(modelId);
+      if (agent === "codex")
+        return /^(?:gpt-|openai-gpt-|o[134]\b|o[134]-|codex)/i.test(modelId);
+      return true;
+    };
+
+    const updatedAgents = [];
     for (const agent of targets) {
+      if (chosenModel && !explicitAgent && targets.length > 1) {
+        const compatible = catalogMatch
+          ? isModelCompatibleWithAgent(agent, catalogMatch, catalogModels)
+          : inferOfflineCompatible(agent, chosenModel);
+        if (!compatible) {
+          console.log(
+            `  ${dim("skipped")} ${cleanLog(agent)} (${cleanLog(chosenModel)} is incompatible with ${cleanLog(agent)})`,
+          );
+          continue;
+        }
+      }
+      if (
+        chosenModel &&
+        explicitAgent &&
+        catalogMatch &&
+        !isModelCompatibleWithAgent(agent, catalogMatch, catalogModels)
+      ) {
+        console.error(
+          red(
+            `Model "${cleanLog(chosenModel)}" is not compatible with ${cleanLog(agent)}. Use OpenCode for multi-provider models (` +
+              `\`npx hallpassai use ${cleanLog(chosenModel)} --agent opencode\`).`,
+          ),
+        );
+        return 1;
+      }
       const targetModel = chosenModel || creds.keys[agent]?.model;
       const res = switchAgentModel(agent, targetModel, {
         reasoningEffort: chosenReasoning,
         catalogModels,
       });
-      const rLabel =
-        chosenReasoning && chosenReasoning !== "auto" && chosenReasoning !== "none"
-          ? ` (reasoning: ${cleanLog(chosenReasoning)})`
-          : chosenReasoning === "auto" || chosenReasoning === "none"
-            ? " (reasoning: default)"
-            : "";
+      updatedAgents.push(agent);
+      const actualModel = res.appliedModel || targetModel;
+      const rLabel = res.appliedReasoning
+        ? ` (reasoning: ${cleanLog(res.appliedReasoning)})`
+        : chosenReasoning === "auto" || chosenReasoning === "none"
+          ? " (reasoning: default)"
+          : "";
       console.log(
-        `${green("✓")} Updated ${bold(cleanLog(agent))} → model ${bold(cleanLog(targetModel))}${rLabel}`,
+        `${green("✓")} Updated ${bold(cleanLog(agent))} → model ${bold(cleanLog(actualModel))}${rLabel}`,
       );
       for (const f of res.files) console.log(`  ${dim("updated")} ${f}`);
+      if (agent === "cursor") {
+        console.log(
+          `  ${dim("note")}    Add "${cleanLog(actualModel)}" in Cursor → Settings → Models.`,
+        );
+      }
+    }
+    if (!updatedAgents.length) {
+      console.error(
+        red(
+          `No configured tool on this machine supports "${cleanLog(chosenModel)}". Configure OpenCode to run all 130+ multi-provider models.`,
+        ),
+      );
+      return 1;
     }
     if (!telemetryDisabled()) {
       await sendCliEvent(
@@ -594,7 +751,7 @@ export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
             cliVersion: pkg.version,
             anonymousId: getAnonymousId(),
             modelId: chosenModel || first?.model,
-            configuredHarnesses: targets,
+            configuredHarnesses: updatedAgents,
           }),
         },
         fetcher ? { fetcher } : undefined,
@@ -683,11 +840,12 @@ export async function main(argv = process.argv.slice(2), { fetcher } = {}) {
       if (res.cursorValues) {
         await runCursorInteractive(res.cursorValues);
       } else {
-        const rNote =
-          args.reasoning && args.reasoning !== "auto" && args.reasoning !== "none"
-            ? dim(` (reasoning: ${cleanLog(args.reasoning)})`)
-            : "";
-        console.log(`${green("✓")} Configured ${bold(cleanLog(agent))}${rNote}`);
+        const rNote = res.appliedReasoning
+          ? dim(` (reasoning: ${cleanLog(res.appliedReasoning)})`)
+          : "";
+        console.log(
+          `${green("✓")} Configured ${bold(cleanLog(agent))} → ${bold(cleanLog(res.appliedModel || claimed.model))}${rNote}`,
+        );
         for (const f of res.files) console.log(`  ${dim("updated")} ${f}`);
         if (res.backup) console.log(`  ${dim("backup")}  ${res.backup}`);
       }

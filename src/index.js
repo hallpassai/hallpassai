@@ -3,6 +3,8 @@ export {
   detectInstalledAgents,
   configureAgent,
   undoAgent,
+  inspectAgentConfig,
+  switchAgentModel,
   upsertCodexToml,
   upsertShellBlock,
   shSingleQuote,
@@ -11,11 +13,15 @@ export {
 export {
   normalizeCode,
   resolveOrigin,
+  originFromApiBase,
+  isValidModelId,
   validateEndpointUrl,
   validateClaimPayload,
   claimCode,
   verifyGatewayReachable,
   sendPairingStatus,
+  revokeServerToken,
+  sendCliEvent,
 } from "./client.js";
 export {
   hallpassDir,

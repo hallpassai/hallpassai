@@ -127,6 +127,17 @@ export function resolveOrigin(prefix, explicitOrigin) {
   return "https://app.hallpassai.com";
 }
 
+const SAFE_MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
+const FORBIDDEN_MODEL_IDS = new Set(["__proto__", "constructor", "prototype"]);
+
+export function isValidModelId(id) {
+  return (
+    typeof id === "string" &&
+    SAFE_MODEL_ID_RE.test(id) &&
+    !FORBIDDEN_MODEL_IDS.has(id)
+  );
+}
+
 export function validateClaimPayload(body, resolvedOrigin) {
   if (!body || typeof body !== "object") {
     throw new Error("Malformed pairing response.");
@@ -143,10 +154,7 @@ export function validateClaimPayload(body, resolvedOrigin) {
   if (typeof body.harness !== "string" || !VALID_HARNESSES.has(body.harness)) {
     throw new Error("Invalid harness in pairing response.");
   }
-  if (
-    typeof body.model !== "string" ||
-    !/^[A-Za-z0-9._:/-]{1,128}$/.test(body.model)
-  ) {
+  if (!isValidModelId(body.model)) {
     throw new Error("Invalid model identifier in pairing response.");
   }
   const progressToken =
@@ -156,15 +164,7 @@ export function validateClaimPayload(body, resolvedOrigin) {
       : null;
   const models = Array.isArray(body.models)
     ? body.models
-        .filter(
-          (m) =>
-            m &&
-            typeof m.id === "string" &&
-            /^[A-Za-z0-9._:/-]{1,128}$/.test(m.id) &&
-            m.id !== "__proto__" &&
-            m.id !== "constructor" &&
-            m.id !== "prototype",
-        )
+        .filter((m) => m && isValidModelId(m.id))
         .map((m) => ({
           id: m.id,
           name:
@@ -180,6 +180,9 @@ export function validateClaimPayload(body, resolvedOrigin) {
             : [],
           ...(Number.isInteger(m.contextLength) && m.contextLength > 0
             ? { contextLength: m.contextLength }
+            : {}),
+          ...(m.reasoning === true || Boolean(m.reasoning?.supported)
+            ? { reasoning: true }
             : {}),
         }))
     : [];
@@ -197,6 +200,14 @@ export function validateClaimPayload(body, resolvedOrigin) {
 }
 
 export function originFromApiBase(apiBase, explicitOrigin = null) {
+  if (explicitOrigin && apiBase) {
+    const safeOrigin = validateEndpointUrl(explicitOrigin, {
+      requireRootPath: true,
+    });
+    const safeBase = validateEndpointUrl(apiBase);
+    assertApiBaseMatchesOrigin(safeBase, safeOrigin);
+    return safeOrigin;
+  }
   if (explicitOrigin) {
     return validateEndpointUrl(explicitOrigin, { requireRootPath: true });
   }
@@ -308,14 +319,7 @@ export async function fetchLiveModels(
     if (!res.ok) return { ok: false, latencyMs: Date.now() - t0, models: [] };
     const body = await res.json().catch(() => ({}));
     const models = Array.isArray(body?.data)
-      ? body.data
-          .filter(
-            (m) =>
-              m &&
-              typeof m.id === "string" &&
-              /^[A-Za-z0-9._:/-]{1,128}$/.test(m.id),
-          )
-          .map((m) => m.id)
+      ? body.data.filter((m) => m && isValidModelId(m.id)).map((m) => m.id)
       : [];
     return { ok: true, latencyMs: Date.now() - t0, models };
   } catch {
@@ -328,7 +332,11 @@ export async function fetchCatalogDetails(
   { fetcher = fetch } = {},
 ) {
   try {
-    const safeOrigin = originFromApiBase(apiBase, origin);
+    const safeOrigin = apiBase
+      ? originFromApiBase(apiBase, origin)
+      : origin
+        ? validateEndpointUrl(origin, { requireRootPath: true })
+        : "https://app.hallpassai.com";
     const res = await fetcher(`${safeOrigin}/api/core/catalog`, {
       method: "GET",
       signal: AbortSignal.timeout(10000),
@@ -338,12 +346,7 @@ export async function fetchCatalogDetails(
     const body = await res.json().catch(() => ({}));
     return Array.isArray(body?.models)
       ? body.models
-          .filter(
-            (m) =>
-              m &&
-              typeof m.id === "string" &&
-              /^[A-Za-z0-9._:/-]{1,128}$/.test(m.id),
-          )
+          .filter((m) => m && isValidModelId(m.id))
           .map((m) => ({
             id: m.id,
             name:
@@ -432,13 +435,14 @@ export async function sendCliEvent(
   { fetcher = fetch } = {},
 ) {
   try {
-    const safeOrigin = origin
-      ? validateEndpointUrl(origin, { requireRootPath: true })
-      : apiBase
-        ? originFromApiBase(apiBase)
+    const safeOrigin = apiBase
+      ? originFromApiBase(apiBase, origin)
+      : origin
+        ? validateEndpointUrl(origin, { requireRootPath: true })
         : "https://app.hallpassai.com";
     const headers = { "Content-Type": "application/json" };
     if (
+      apiBase &&
       typeof token === "string" &&
       /^hp_live_[A-Za-z0-9_-]{43}$/.test(token)
     ) {

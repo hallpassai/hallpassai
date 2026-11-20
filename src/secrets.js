@@ -98,6 +98,11 @@ export function getAnonymousId(homeDir = os.homedir(), env = process.env) {
 
 export function ensurePrivateDir(dir) {
   assertNotSymlink(dir);
+  const resolved = path.resolve(dir);
+  const realHome = path.resolve(os.homedir());
+  if (resolved === realHome || resolved === path.parse(resolved).root) {
+    return;
+  }
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   try {
     fs.chmodSync(dir, 0o700);
@@ -108,7 +113,13 @@ export function ensurePrivateDir(dir) {
 export function writePrivateFile(filePath, content, mode = 0o600) {
   assertNotSymlink(filePath);
   const parent = path.dirname(filePath);
-  if ((mode & 0o077) === 0) {
+  const baseName = path.basename(parent);
+  const isHomeRoot =
+    path.resolve(parent) === path.resolve(os.homedir()) ||
+    (!baseName.startsWith(".") &&
+      !parent.includes(`${path.sep}.`) &&
+      path.basename(filePath).startsWith("."));
+  if ((mode & 0o077) === 0 && !isHomeRoot) {
     ensurePrivateDir(parent);
   } else {
     assertNotSymlink(parent);

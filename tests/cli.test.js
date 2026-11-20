@@ -10,8 +10,13 @@ import { promisify } from "node:util";
 import {
   configureAgent,
   undoAgent,
+  switchAgentModel,
+  upsertCodexToml,
   normalizeCode,
   resolveOrigin,
+  originFromApiBase,
+  revokeServerToken,
+  sendCliEvent,
   validateEndpointUrl,
   validateClaimPayload,
   shSingleQuote,
@@ -382,7 +387,38 @@ test("end-to-end CLI claims pairing code over HTTP, configures tool, verifies /v
         res.end(
           JSON.stringify({
             object: "list",
-            data: [{ id: "claude-sonnet-4-6" }, { id: "gpt-5.4" }],
+            data: [{ id: "claude-sonnet-4-6" }, { id: "claude-opus-5.5" }, { id: "gpt-5.4" }],
+          }),
+        );
+      } else if (req.url === "/api/core/catalog") {
+        res.end(
+          JSON.stringify({
+            models: [
+              {
+                id: "claude-sonnet-4-6",
+                name: "Claude Sonnet 4.6",
+                provider: "Anthropic",
+                protocols: ["messages", "chat/completions"],
+                contextLength: 200000,
+                reasoning: { supported: true, levels: ["low", "medium", "high", "max"] },
+              },
+              {
+                id: "claude-opus-5.5",
+                name: "Claude Opus 5.5",
+                provider: "Anthropic",
+                protocols: ["messages", "chat/completions"],
+                contextLength: 1000000,
+                reasoning: { supported: true, levels: ["low", "medium", "high", "max"] },
+              },
+              {
+                id: "gpt-5.4",
+                name: "GPT-5.4",
+                provider: "OpenAI",
+                protocols: ["responses", "chat/completions"],
+                contextLength: 256000,
+                reasoning: { supported: true, levels: ["low", "medium", "high"] },
+              },
+            ],
           }),
         );
       } else if (req.url === "/api/core/cli/revoke") {
@@ -397,7 +433,10 @@ test("end-to-end CLI claims pairing code over HTTP, configures tool, verifies /v
     });
 
     assert.equal(await cliMain(["doctor", "--origin", base]), 0);
-    assert.equal(await cliMain(["models", "--origin", base]), 0);
+    assert.equal(
+      await cliMain(["models", "--provider", "Anthropic", "--search", "opus 5.5", "--origin", base]),
+      0,
+    );
     assert.equal(
       await cliMain(["use", "claude-opus-5.5", "--reasoning", "high", "--origin", base]),
       0,
@@ -407,7 +446,17 @@ test("end-to-end CLI claims pairing code over HTTP, configures tool, verifies /v
     );
     assert.equal(updatedClaude.env.ANTHROPIC_MODEL, "claude-opus-5.5");
     assert.equal(updatedClaude.effortLevel, "high");
-    assert.equal(updatedClaude.env.CLAUDE_CODE_EFFORT_LEVEL, "high");
+    assert.equal(updatedClaude.env.CLAUDE_CODE_EFFORT_LEVEL, undefined);
+
+    // Resetting `--reasoning auto` clears effortLevel even when user keys exist
+    assert.equal(
+      await cliMain(["use", "--reasoning", "auto", "--origin", base]),
+      0,
+    );
+    const resetClaude = JSON.parse(
+      fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"),
+    );
+    assert.equal(resetClaude.effortLevel, undefined);
 
     assert.equal(await cliMain(["uninstall", "--origin", base]), 0);
     assert.equal(revokedAuth, `Bearer ${SAMPLE_PAYLOAD.token}`);
@@ -525,4 +574,102 @@ test("packed npm tarball extracts cleanly and runs real CLI subprocess across al
     await new Promise((r) => server.close(r));
     fs.rmSync(work, { recursive: true, force: true });
   }
+});
+
+test("security & multi-harness regressions: blocks foreign --origin token exfiltration, rejects unknown flags, resets effort cleanly, and isolates native models", async () => {
+  // 1. Unknown CLI flags must throw instead of silently becoming model IDs
+  assert.throws(() => parseArgs(["use", "--resoning", "high"]), /Unknown option/);
+  assert.deepEqual(
+    parseArgs(["use", "-m", "gpt-5.4", "--reasoning=high"]).modelArg,
+    "gpt-5.4",
+  );
+
+  // 2. Foreign --origin must never exfiltrate stored Bearer token
+  assert.throws(
+    () =>
+      originFromApiBase(
+        "https://api.hallpassai.com/v1",
+        "https://attacker.example",
+      ),
+    /Untrusted apiBase host/,
+  );
+  let leaked = false;
+  await revokeServerToken(
+    {
+      origin: "https://attacker.example",
+      apiBase: "https://api.hallpassai.com/v1",
+      token: SAMPLE_PAYLOAD.token,
+    },
+    {
+      fetcher: async () => {
+        leaked = true;
+        return { ok: true, json: async () => ({ revoked: true }) };
+      },
+    },
+  );
+  await sendCliEvent(
+    "cli_status",
+    {
+      origin: "https://attacker.example",
+      apiBase: "https://api.hallpassai.com/v1",
+      token: SAMPLE_PAYLOAD.token,
+    },
+    {
+      fetcher: async () => {
+        leaked = true;
+        return { ok: true };
+      },
+    },
+  );
+  assert.equal(leaked, false, "foreign --origin must never receive stored Bearer token");
+
+  // 3. Claude settings with user permissions clears effortLevel on auto reset, and Codex config.toml omits deprecated [profiles.*]
+  withTempHome((home) => {
+    const claudeDir = path.join(home, ".claude");
+    fs.mkdirSync(claudeDir, { recursive: true });
+    const settingsPath = path.join(claudeDir, "settings.json");
+    fs.writeFileSync(
+      settingsPath,
+      JSON.stringify({ permissions: { allow: ["Read"] } }, null, 2),
+    );
+    configureAgent("claude-code", SAMPLE_PAYLOAD, {
+      homeDir: home,
+      reasoningEffort: "high",
+    });
+    assert.equal(
+      JSON.parse(fs.readFileSync(settingsPath, "utf8")).effortLevel,
+      "high",
+    );
+    switchAgentModel("claude-code", "claude-sonnet-4-6", {
+      homeDir: home,
+      reasoningEffort: "auto",
+      catalogModels: SAMPLE_PAYLOAD.models,
+    });
+    const afterReset = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    assert.equal(afterReset.effortLevel, undefined);
+    assert.deepEqual(afterReset.permissions, { allow: ["Read"] });
+
+    // Codex upsertCodexToml removes model_reasoning_effort without overrunning [mcp_servers.*] and omits legacy [profiles.*]
+    const tomlWithReasoning = upsertCodexToml(
+      '[mcp_servers.local]\nmodel = "keep-inside-section"\n',
+      {
+        model: "gpt-5.4",
+        apiBase: "https://api.hallpassai.com/v1",
+        nodePath: process.execPath,
+        helperPath: "/tmp/read-key.mjs",
+        reasoningEffort: "high",
+      },
+    );
+    assert.match(tomlWithReasoning, /model_reasoning_effort = "high"/);
+    assert.ok(!tomlWithReasoning.includes("[profiles."), "Codex 0.170+ forbids legacy [profiles.*]");
+    const tomlCleared = upsertCodexToml(tomlWithReasoning, {
+      model: "gpt-5.4",
+      apiBase: "https://api.hallpassai.com/v1",
+      nodePath: process.execPath,
+      helperPath: "/tmp/read-key.mjs",
+      reasoningEffort: null,
+    });
+    assert.ok(!tomlCleared.includes("model_reasoning_effort"));
+    assert.match(tomlCleared, /\[mcp_servers\.local\]\nmodel = "keep-inside-section"/);
+  });
 });

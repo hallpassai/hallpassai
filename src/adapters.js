@@ -165,8 +165,8 @@ function supportsReasoningId(id = "") {
   return (
     /^claude-(?:opus|sonnet|fable)/.test(s) ||
     /^claude-(?:3-7|4|5)/.test(s) ||
-    /^(?:gpt-[56]|o[134]|codex)/.test(s) ||
-    /^(?:deepseek-(?:r1|v3\.2|v4)|qwen3|qwq|kimi-k[23]|gemini-(?:2\.5|3|4)|grok-[34]|glm-[45]|minimax-m2)/.test(
+    /^(?:gpt-[56]|openai-gpt-oss|o[134]|codex)/.test(s) ||
+    /^(?:deepseek-(?:r1|v3\.2|v4)|qwen-?3|qwq|kimi-k[23]|gemini-(?:2\.5|3|4)|grok-[34]|glm-[45]|minimax-m[23])/.test(
       s,
     )
   );
@@ -176,6 +176,11 @@ function stripHallpassFromCodexToml(existingToml, { removeTopLevelProvider = fal
   const lines = existingToml
     ? existingToml.replace(/\r\n/g, "\n").split("\n")
     : [];
+  const hadAnyHallpass = lines.some(
+    (l) =>
+      /^\s*model_provider\s*=\s*"hallpass"\s*(?:#.*)?$/.test(l) ||
+      /^\s*\[\s*model_providers\.hallpass(?:\.[^\]]+)?\s*\]\s*(?:#.*)?$/.test(l),
+  );
   const kept = [];
   let skippingHallpass = false;
   for (const line of lines) {
@@ -185,7 +190,7 @@ function stripHallpassFromCodexToml(existingToml, { removeTopLevelProvider = fal
       skippingHallpass =
         name === "model_providers.hallpass" ||
         name.startsWith("model_providers.hallpass.") ||
-        CODEX_HALLPASS_PROFILES.has(name);
+        (hadAnyHallpass && CODEX_HALLPASS_PROFILES.has(name));
     }
     if (!skippingHallpass) kept.push(line);
   }
@@ -222,13 +227,13 @@ export function upsertCodexToml(
   const kept = stripHallpassFromCodexToml(existingToml);
   const codexEff =
     reasoningEffort &&
-    ["minimal", "low", "medium", "high", "xhigh"].includes(reasoningEffort)
+    ["none", "minimal", "low", "medium", "high", "xhigh"].includes(reasoningEffort)
       ? reasoningEffort
       : null;
 
   // Update or insert top-level `model`, `model_provider`, and optional `model_reasoning_effort` BEFORE the first `[section]` / `[[array]]`.
   const firstSectionIdx = kept.findIndex((l) => TOML_HEADER_RE.test(l));
-  const limit = firstSectionIdx === -1 ? kept.length : firstSectionIdx;
+  let limit = firstSectionIdx === -1 ? kept.length : firstSectionIdx;
   let sawModel = false;
   let sawProvider = false;
   let sawWebSearch = false;
@@ -250,6 +255,7 @@ export function upsertCodexToml(
       } else {
         kept.splice(i, 1);
         i--;
+        limit--;
       }
     }
   }
@@ -281,18 +287,6 @@ export function upsertCodexToml(
     `command = ${tomlBasicString(nodePath)}`,
     `args = [${tomlBasicString(helperPath)}, "codex"]`,
     `timeout_ms = 3000`,
-    "",
-    "[profiles.fast]",
-    `model = ${tomlBasicString(model)}`,
-    `model_reasoning_effort = "low"`,
-    "",
-    "[profiles.balanced]",
-    `model = ${tomlBasicString(model)}`,
-    `model_reasoning_effort = "medium"`,
-    "",
-    "[profiles.deep]",
-    `model = ${tomlBasicString(model)}`,
-    `model_reasoning_effort = "high"`,
     "",
   ];
   return [...kept, ...block].join("\n");
@@ -388,17 +382,20 @@ export function configureAgent(
   const { token, apiBase, model, models = [] } = payload;
   const effectiveToken = dryRun ? "hp_live_••••••••" : token;
   const anthropicBase = apiBase.replace(/\/v1\/?$/, "");
-  const normEffort =
+  const rawEffort =
     typeof reasoningEffort === "string" &&
-    VALID_REASONING_LEVELS.has(reasoningEffort.toLowerCase()) &&
-    reasoningEffort.toLowerCase() !== "auto" &&
-    reasoningEffort.toLowerCase() !== "none"
+    VALID_REASONING_LEVELS.has(reasoningEffort.toLowerCase())
       ? reasoningEffort.toLowerCase()
       : null;
+  const normEffort =
+    rawEffort && rawEffort !== "auto" && rawEffort !== "none" ? rawEffort : null;
 
   if (agent === "claude-code") {
     const settingsPath = path.join(homeDir, ".claude", "settings.json");
     const current = readJsonSafe(settingsPath);
+    const wasManagedByHallpass = Boolean(
+      current?.env?.ANTHROPIC_BASE_URL && current?.env?.ANTHROPIC_AUTH_TOKEN,
+    );
     const claudeModels = models.filter(
       (m) =>
         m.protocols?.includes("messages") &&
@@ -406,21 +403,30 @@ export function configureAgent(
     );
     const chosenClaude =
       claudeModels.find((m) => m.id === model)?.id ||
+      claudeModels[0]?.id ||
       models.find((m) => m.id === model && m.protocols?.includes("messages"))
         ?.id ||
-      claudeModels[0]?.id ||
+      models.find((m) => m.protocols?.includes("messages"))?.id ||
       model;
     const defaultOpus = claudeModels.find((m) => /opus/i.test(m.id))?.id;
     const defaultSonnet = claudeModels.find((m) => /sonnet/i.test(m.id))?.id;
     const defaultHaiku = claudeModels.find((m) => /haiku/i.test(m.id))?.id;
+    const mappedClaudeEffort =
+      normEffort === "xhigh"
+        ? "max"
+        : normEffort === "minimal"
+          ? "low"
+          : normEffort;
     const claudeEffort =
-      normEffort && ["low", "medium", "high", "max"].includes(normEffort)
-        ? normEffort
+      mappedClaudeEffort &&
+      ["low", "medium", "high", "max"].includes(mappedClaudeEffort) &&
+      supportsReasoningId(chosenClaude)
+        ? mappedClaudeEffort
         : null;
 
     const hasNonHallpassClaudeKeys = (() => {
       const probe = structuredClone(current);
-      delete probe.effortLevel;
+      if (wasManagedByHallpass) delete probe.effortLevel;
       if (probe.env && typeof probe.env === "object") {
         delete probe.env.ANTHROPIC_BASE_URL;
         delete probe.env.ANTHROPIC_AUTH_TOKEN;
@@ -448,15 +454,15 @@ export function configureAgent(
       ...(defaultSonnet ? { ANTHROPIC_DEFAULT_SONNET_MODEL: defaultSonnet } : {}),
       ...(defaultHaiku ? { ANTHROPIC_DEFAULT_HAIKU_MODEL: defaultHaiku } : {}),
     };
-    if (claudeEffort) nextEnv.CLAUDE_CODE_EFFORT_LEVEL = claudeEffort;
-    else delete nextEnv.CLAUDE_CODE_EFFORT_LEVEL;
+    // Never write env.CLAUDE_CODE_EFFORT_LEVEL because it locks session effort and blocks live `/effort` switching.
+    delete nextEnv.CLAUDE_CODE_EFFORT_LEVEL;
 
     const next = {
       ...current,
       ...(claudeEffort ? { effortLevel: claudeEffort } : {}),
       env: nextEnv,
     };
-    if (!claudeEffort && Object.hasOwn(next, "effortLevel") && !hasNonHallpassClaudeKeys) {
+    if (!claudeEffort && Object.hasOwn(next, "effortLevel")) {
       delete next.effortLevel;
     }
     const content = JSON.stringify(next, null, 2) + "\n";
@@ -472,12 +478,20 @@ export function configureAgent(
       writePrivateFile(settingsPath, content, 0o600);
       return {
         agent,
+        appliedModel: chosenClaude,
+        appliedReasoning: claudeEffort,
         files: [settingsPath],
         backup,
         nextStep: "Run `claude` in this terminal (switch models & effort anytime with `/model` and `/effort`).",
       };
     }
-    return { agent, files: [settingsPath], preview: content };
+    return {
+      agent,
+      appliedModel: chosenClaude,
+      appliedReasoning: claudeEffort,
+      files: [settingsPath],
+      preview: content,
+    };
   }
 
   if (agent === "codex") {
@@ -490,20 +504,25 @@ export function configureAgent(
     const openAiResponses = models.filter(
       (m) =>
         m.protocols?.includes("responses") &&
-        (m.provider === "OpenAI" || /^(?:gpt-|o[134]|codex)/i.test(m.id)),
+        (m.provider === "OpenAI" || /^(?:gpt-|openai-gpt-|o[134]|codex)/i.test(m.id)),
     );
     const compatible =
+      openAiResponses.find((m) => m.id === model)?.id ||
+      openAiResponses[0]?.id ||
       models.find((m) => m.id === model && m.protocols?.includes("responses"))
         ?.id ||
-      openAiResponses[0]?.id ||
       models.find((m) => m.protocols?.includes("responses"))?.id ||
       model;
+    const rawCodexEff =
+      rawEffort === "none"
+        ? "none"
+        : normEffort && ["minimal", "low", "medium", "high", "xhigh"].includes(normEffort)
+          ? normEffort
+          : normEffort === "max"
+            ? "xhigh"
+            : null;
     const codexEffort =
-      normEffort && ["minimal", "low", "medium", "high", "xhigh"].includes(normEffort)
-        ? normEffort
-        : normEffort === "max"
-          ? "xhigh"
-          : null;
+      rawCodexEff && supportsReasoningId(compatible) ? rawCodexEff : null;
     const content = upsertCodexToml(existing, {
       model: compatible,
       apiBase,
@@ -526,18 +545,32 @@ export function configureAgent(
       writePrivateFile(configPath, content, 0o600);
       return {
         agent,
+        appliedModel: compatible,
+        appliedReasoning: codexEffort,
         files: [configPath, helperPath],
         backup,
-        nextStep: "Run `codex` (or `codex -p deep` / `codex -p fast` for reasoning profiles).",
+        nextStep: 'Run `codex` (override reasoning anytime with `codex -c model_reasoning_effort="high"`).',
       };
     }
-    return { agent, files: [configPath], preview: content };
+    return {
+      agent,
+      appliedModel: compatible,
+      appliedReasoning: codexEffort,
+      files: [configPath],
+      preview: content,
+    };
   }
 
   if (agent === "opencode") {
     const { configDir, dataDir } = resolveOpencodeDirs(homeDir);
     const configPath = path.join(configDir, "opencode.json");
     const authPath = path.join(dataDir, "auth.json");
+    const currentCfg = readJsonSafe(configPath);
+    const existingModels =
+      currentCfg.provider?.hallpass?.models &&
+      typeof currentCfg.provider.hallpass.models === "object"
+        ? currentCfg.provider.hallpass.models
+        : {};
 
     const chatModels = models.filter((m) =>
       m.protocols?.includes("chat/completions"),
@@ -546,13 +579,32 @@ export function configureAgent(
       chatModels.find((m) => m.id === model)?.id ||
       chatModels[0]?.id ||
       model;
-    const ocEffort =
+    const mappedOcEff =
       normEffort && ["low", "medium", "high"].includes(normEffort)
         ? normEffort
         : normEffort === "max" || normEffort === "xhigh"
           ? "high"
-          : null;
+          : normEffort === "minimal"
+            ? "low"
+            : null;
+    const chosenSupportsReasoning = Boolean(
+      chatModels.find((m) => m.id === chosenModel)?.reasoning ||
+        supportsReasoningId(chosenModel),
+    );
+    const ocEffort = chosenSupportsReasoning ? mappedOcEff : null;
     const modelEntries = Object.create(null);
+    // Preserve previously configured catalog models when offline (`models` only has 1 fallback item)
+    if (chatModels.length <= 1) {
+      for (const [k, v] of Object.entries(existingModels)) {
+        if (k === "__proto__" || k === "constructor" || k === "prototype")
+          continue;
+        if (v && typeof v === "object") {
+          const clone = { ...v };
+          delete clone.options;
+          modelEntries[k] = clone;
+        }
+      }
+    }
     for (const m of chatModels.length
       ? chatModels
       : [{ id: chosenModel, name: chosenModel }]) {
@@ -562,16 +614,20 @@ export function configureAgent(
         m.id === "prototype"
       )
         continue;
-      const canReason = supportsReasoningId(m.id);
+      const canReason = Boolean(m.reasoning || supportsReasoningId(m.id));
+      const prevEntry = modelEntries[m.id];
       const ctxLimit =
         Number.isInteger(m.contextLength) && m.contextLength > 0
           ? m.contextLength
-          : 128000;
+          : Number.isInteger(prevEntry?.limit?.context) && prevEntry.limit.context > 0
+            ? prevEntry.limit.context
+            : 128000;
       modelEntries[m.id] = {
-        name: m.name || m.id,
-        ...(canReason ? { reasoning: true, tool_call: true } : {}),
+        name: m.name || prevEntry?.name || m.id,
+        tool_call: true,
+        ...(canReason ? { reasoning: true } : {}),
         limit: { context: ctxLimit, output: 8192 },
-        ...(ocEffort && m.id === chosenModel
+        ...(canReason && ocEffort && m.id === chosenModel
           ? { options: { reasoningEffort: ocEffort } }
           : {}),
         ...(canReason
@@ -586,7 +642,6 @@ export function configureAgent(
       };
     }
 
-    const currentCfg = readJsonSafe(configPath);
     const nextCfg = {
       $schema: currentCfg.$schema || "https://opencode.ai/config.json",
       ...currentCfg,
@@ -635,12 +690,20 @@ export function configureAgent(
       writePrivateFile(authPath, authContent, 0o600);
       return {
         agent,
+        appliedModel: chosenModel,
+        appliedReasoning: ocEffort,
         files: [configPath, authPath],
         backup,
         nextStep: "Run `opencode` in this terminal and send your first prompt.",
       };
     }
-    return { agent, files: [configPath, authPath], preview: cfgContent };
+    return {
+      agent,
+      appliedModel: chosenModel,
+      appliedReasoning: ocEffort,
+      files: [configPath, authPath],
+      preview: cfgContent,
+    };
   }
 
   if (agent === "copilot") {
@@ -680,17 +743,25 @@ export function configureAgent(
         .trim();
       const backup = nonHallpassRc ? backupOnce(rcPath) : null;
       const rcMode = fs.existsSync(rcPath)
-        ? fs.statSync(rcPath).mode & 0o777 || 0o600
-        : 0o600;
+        ? fs.statSync(rcPath).mode & 0o777 || 0o644
+        : 0o644;
       writePrivateFile(rcPath, nextRc, rcMode);
       return {
         agent,
+        appliedModel: chosenModel,
+        appliedReasoning: null,
         files: [envPath, rcPath],
         backup,
         nextStep: `Run \`source ${shSingleQuote(envPath)} && copilot\` in this terminal (new terminals load it automatically).`,
       };
     }
-    return { agent, files: [envPath, rcPath], preview: envContent };
+    return {
+      agent,
+      appliedModel: chosenModel,
+      appliedReasoning: null,
+      files: [envPath, rcPath],
+      preview: envContent,
+    };
   }
 
   if (agent === "cursor") {
@@ -705,6 +776,8 @@ export function configureAgent(
     }
     return {
       agent,
+      appliedModel: chosenModel,
+      appliedReasoning: null,
       files: [],
       cursorValues: {
         apiKey: effectiveToken,
@@ -902,6 +975,8 @@ export function inspectAgentConfig(
       return {
         ok,
         configPath: fp,
+        diskModel: cfg?.env?.ANTHROPIC_MODEL || null,
+        diskReasoning: cfg?.effortLevel || null,
         note: ok
           ? "settings.json wired to HallPass"
           : "settings.json missing HallPass env",
@@ -913,9 +988,13 @@ export function inspectAgentConfig(
       const helper = helperScriptPath(homeDir);
       const ok =
         raw.includes('model_provider = "hallpass"') && fs.existsSync(helper);
+      const mMatch = raw.match(/^\s*model\s*=\s*"([^"]+)"/m);
+      const rMatch = raw.match(/^\s*model_reasoning_effort\s*=\s*"([^"]+)"/m);
       return {
         ok,
         configPath: fp,
+        diskModel: mMatch ? mMatch[1] : null,
+        diskReasoning: rMatch ? rMatch[1] : null,
         note: ok
           ? "config.toml + credential helper present"
           : "config.toml or read-key.mjs missing",
@@ -928,9 +1007,20 @@ export function inspectAgentConfig(
       const cfg = readJsonSafe(cfgPath);
       const auth = readJsonSafe(authPath);
       const ok = Boolean(cfg?.provider?.hallpass && auth?.hallpass?.key);
+      const diskModel =
+        typeof cfg?.model === "string" && cfg.model.startsWith("hallpass/")
+          ? cfg.model.slice("hallpass/".length)
+          : null;
+      const diskReasoning =
+        (diskModel &&
+          cfg?.provider?.hallpass?.models?.[diskModel]?.options
+            ?.reasoningEffort) ||
+        null;
       return {
         ok,
         configPath: cfgPath,
+        diskModel,
+        diskReasoning,
         note: ok
           ? "opencode.json + auth.json wired to HallPass"
           : "opencode config or auth missing",
@@ -942,10 +1032,14 @@ export function inspectAgentConfig(
         ? path.join(homeDir, ".bashrc")
         : path.join(homeDir, ".zshrc");
       const rcRaw = fs.existsSync(rcPath) ? fs.readFileSync(rcPath, "utf8") : "";
+      const envRaw = fs.existsSync(envPath) ? fs.readFileSync(envPath, "utf8") : "";
       const ok = fs.existsSync(envPath) && rcRaw.includes(SHELL_START);
+      const mMatch = envRaw.match(/COPILOT_MODEL='([^']+)'/);
       return {
         ok,
         configPath: envPath,
+        diskModel: mMatch ? mMatch[1] : null,
+        diskReasoning: null,
         note: ok
           ? `copilot.env + ${path.basename(rcPath)} profile block active`
           : "copilot.env or shell profile block missing",
@@ -957,6 +1051,8 @@ export function inspectAgentConfig(
       return {
         ok,
         configPath: "Cursor → Settings → Models",
+        diskModel: creds.keys?.cursor?.model || null,
+        diskReasoning: null,
         note: ok
           ? "Credentials saved locally (set in Cursor → Settings → Models)"
           : "No stored Cursor credentials",
