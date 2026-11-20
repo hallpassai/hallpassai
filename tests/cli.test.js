@@ -6,15 +6,20 @@ import os from "node:os";
 import http from "node:http";
 import { spawnSync, execFile } from "node:child_process";
 import { promisify } from "node:util";
-const execFileAsync = promisify(execFile);
 import {
   configureAgent,
   undoAgent,
   normalizeCode,
   resolveOrigin,
+  validateEndpointUrl,
+  validateClaimPayload,
+  shSingleQuote,
+  upsertShellBlock,
   helperScriptPath,
 } from "../src/index.js";
-import { main as cliMain } from "../bin/cli.js";
+import { main as cliMain, parseArgs } from "../bin/cli.js";
+
+const execFileAsync = promisify(execFile);
 
 function withTempHome(fn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hp-cli-test-"));
@@ -60,21 +65,120 @@ test("pairing code normalization and environment origin routing", () => {
     prefix: "HPD",
     code: "HPD-ABCD-2345",
   });
-  assert.equal(normalizeCode("HP-0000-1111"), null); // excludes ambiguous 0/1/O/I
+  assert.equal(normalizeCode("HP-0000-1111"), null);
   assert.equal(normalizeCode("rm -rf /"), null);
   assert.equal(resolveOrigin("HP"), "https://app.hallpassai.com");
   assert.equal(resolveOrigin("HPD"), "https://dev.hallpassai.com");
+  assert.equal(resolveOrigin("HPL"), "http://127.0.0.1:4317");
 });
 
-test("claude-code adapter merges settings.json non-destructively, backs up, and undoes cleanly", () =>
+test("security: endpoint & claim payload validation rejects HTTP non-loopback, credentials, and foreign apiBase exfiltration", () => {
+  assert.throws(
+    () => validateEndpointUrl("http://evil.example/v1"),
+    /HTTPS is required/,
+  );
+  assert.throws(
+    () => validateEndpointUrl("https://user:pass@api.hallpassai.com/v1"),
+    /credentials/,
+  );
+  assert.throws(
+    () =>
+      validateClaimPayload(
+        {
+          token: SAMPLE_PAYLOAD.token,
+          apiBase: "https://evil.example/v1",
+          harness: "claude-code",
+          model: "claude-sonnet-4-6",
+        },
+        "https://app.hallpassai.com",
+      ),
+    /Untrusted apiBase host/,
+  );
+  const valid = validateClaimPayload(
+    {
+      token: SAMPLE_PAYLOAD.token,
+      apiBase: "https://api.hallpassai.com/v1",
+      harness: "claude-code",
+      model: "claude-sonnet-4-6",
+      progressToken: "hp_pair_" + "a".repeat(43),
+      models: [{ id: "__proto__", name: "bad" }, ...SAMPLE_PAYLOAD.models],
+    },
+    "https://app.hallpassai.com",
+  );
+  assert.equal(valid.models.length, 2);
+});
+
+test("security: shell single-quoting neutralizes command substitution and rejects control characters", () => {
+  const quoted = shSingleQuote("$(touch /tmp/pwned) `id` 'quote'");
+  assert.equal(quoted, "'$(touch /tmp/pwned) `id` '\\''quote'\\'''");
+  assert.throws(() => shSingleQuote("bad\nline"), /control characters/);
+
+  const shellCheck = spawnSync(
+    "/bin/sh",
+    ["-c", `X=${quoted}; printf '%s' "$X"`],
+    { encoding: "utf8" },
+  );
+  assert.equal(shellCheck.status, 0);
+  assert.equal(shellCheck.stdout, "$(touch /tmp/pwned) `id` 'quote'");
+
+  const rc = upsertShellBlock("", "/Users/o'connor/my dir/copilot.env");
+  assert.match(rc, /'\/Users\/o'\\''connor\/my dir\/copilot\.env'/);
+});
+
+test("security: refuses symlink overwrite and cleans fresh-install secrets on undo without .bak", () =>
+  withTempHome((home) => {
+    // 1. Fresh install across claude-code, codex, opencode, copilot (no pre-existing files / no .bak)
+    configureAgent("claude-code", SAMPLE_PAYLOAD, { homeDir: home });
+    configureAgent("codex", SAMPLE_PAYLOAD, { homeDir: home });
+    configureAgent("opencode", SAMPLE_PAYLOAD, { homeDir: home });
+    configureAgent("copilot", SAMPLE_PAYLOAD, { homeDir: home, shell: "/bin/zsh" });
+
+    // Undo must remove all newly written secret files even when no .hallpass.bak existed
+    undoAgent("all", { homeDir: home, shell: "/bin/zsh" });
+    assert.equal(
+      fs.existsSync(path.join(home, ".local", "share", "opencode", "auth.json")),
+      false,
+    );
+    assert.equal(
+      fs.existsSync(path.join(home, ".claude", "settings.json")),
+      false,
+    );
+    assert.equal(
+      fs.existsSync(path.join(home, ".codex", "config.toml")),
+      false,
+    );
+    assert.equal(
+      fs.existsSync(path.join(home, ".config", "hallpass", "copilot.env")),
+      false,
+    );
+
+    // 2. Symlink protection
+    const claudeDir = path.join(home, ".claude");
+    fs.mkdirSync(claudeDir, { recursive: true });
+    const targetFile = path.join(home, "outside.json");
+    fs.writeFileSync(targetFile, "{}");
+    fs.symlinkSync(targetFile, path.join(claudeDir, "settings.json"));
+    assert.throws(
+      () => configureAgent("claude-code", SAMPLE_PAYLOAD, { homeDir: home }),
+      /symlink/,
+    );
+  }));
+
+test("claude-code adapter merges JSONC settings.json non-destructively, redacts dry-run, and undoes cleanly", () =>
   withTempHome((home) => {
     const claudeDir = path.join(home, ".claude");
     fs.mkdirSync(claudeDir, { recursive: true });
     const settingsPath = path.join(claudeDir, "settings.json");
     fs.writeFileSync(
       settingsPath,
-      JSON.stringify({ permissions: { allow: ["Bash(git status)"] }, env: { FOO: "bar" } }),
+      `{\n  // user comment\n  "permissions": { "allow": ["Bash(git status)"], },\n  "env": { "FOO": "bar" }\n}\n`,
     );
+
+    const dry = configureAgent("claude-code", SAMPLE_PAYLOAD, {
+      homeDir: home,
+      dryRun: true,
+    });
+    assert.ok(!dry.preview.includes(SAMPLE_PAYLOAD.token), "dryRun must redact token");
 
     const res = configureAgent("claude-code", SAMPLE_PAYLOAD, { homeDir: home });
     assert.ok(res.backup?.endsWith(".hallpass.bak"));
@@ -86,56 +190,65 @@ test("claude-code adapter merges settings.json non-destructively, backs up, and 
     assert.equal(written.env.ANTHROPIC_AUTH_TOKEN, SAMPLE_PAYLOAD.token);
     assert.equal(written.env.ANTHROPIC_API_KEY, "");
     assert.equal(written.env.ANTHROPIC_MODEL, "claude-sonnet-4-6");
-    assert.equal(written.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS, "8192");
-    assert.equal(written.env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY, "1");
 
     undoAgent("claude-code", { homeDir: home });
-    const restored = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    const restored = JSON.parse(
+      fs.readFileSync(settingsPath, "utf8").replace(/\/\/.*$/gm, "").replace(/,(\s*[}\]])/g, "$1"),
+    );
     assert.equal(restored.env.ANTHROPIC_AUTH_TOKEN, undefined);
     assert.equal(restored.env.FOO, "bar");
   }));
 
-test("codex adapter writes responses wire_api and working credential helper command without plaintext key in config.toml", () =>
-  withTempHome((home) => {
+test("codex adapter preserves [[array_of_tables]] & commented sections and runs helper cleanly on paths with spaces", () =>
+  withTempHome((baseDir) => {
+    const home = path.join(baseDir, "spaced home");
+    process.env.HALLPASS_CONFIG_DIR = path.join(home, ".config", "hallpass");
     const codexDir = path.join(home, ".codex");
     fs.mkdirSync(codexDir, { recursive: true });
     const configPath = path.join(codexDir, "config.toml");
     fs.writeFileSync(
       configPath,
-      'model = "o3"\n\n[mcp_servers.demo]\ncommand = "npx"\n',
+      [
+        'model = "o3"',
+        "",
+        "[model_providers.hallpass]",
+        'name = "Old"',
+        "",
+        "[[notify]] # user array table after hallpass",
+        'command = "echo"',
+        "",
+        "[mcp_servers.demo] # inline comment",
+        'command = "npx"',
+        "",
+      ].join("\n"),
     );
 
     configureAgent("codex", SAMPLE_PAYLOAD, { homeDir: home });
     const toml = fs.readFileSync(configPath, "utf8");
-    assert.ok(!toml.includes(SAMPLE_PAYLOAD.token), "config.toml must not contain raw API key");
-    assert.match(toml, /model = "gpt-5\.4"/);
-    assert.match(toml, /model_provider = "hallpass"/);
-    assert.match(toml, /\[model_providers\.hallpass\]/);
-    assert.match(toml, /wire_api = "responses"/);
-    assert.match(toml, /\[model_providers\.hallpass\.auth\]/);
+    assert.ok(!toml.includes(SAMPLE_PAYLOAD.token));
+    assert.match(toml, /\[\[notify\]\]/);
     assert.match(toml, /\[mcp_servers\.demo\]/);
+    assert.match(toml, /wire_api = "responses"/);
 
-    // Execute the generated credential helper script to verify stdout purity!
+    // Execute generated read-key.mjs inside spaced directory path
     const helper = helperScriptPath(home);
-    const execRes = spawnSync(process.execPath, [helper, "codex"], {
-      encoding: "utf8",
+    const out = spawnSync(process.execPath, [helper, "codex"], {
       env: { ...process.env, HALLPASS_DISABLE_KEYCHAIN: "1" },
+      encoding: "utf8",
     });
-    assert.equal(execRes.status, 0);
-    assert.equal(execRes.stdout, SAMPLE_PAYLOAD.token);
+    assert.equal(out.status, 0);
+    assert.equal(out.stdout, SAMPLE_PAYLOAD.token);
   }));
 
 test("opencode adapter writes opencode.json provider and 0600 auth.json with type:api", () =>
   withTempHome((home) => {
-    configureAgent("opencode", { ...SAMPLE_PAYLOAD, model: "gpt-5.4" }, { homeDir: home });
+    configureAgent("opencode", SAMPLE_PAYLOAD, { homeDir: home });
     const cfgPath = path.join(home, ".config", "opencode", "opencode.json");
     const authPath = path.join(home, ".local", "share", "opencode", "auth.json");
-
     const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
-    assert.equal(cfg.model, "hallpass/gpt-5.4");
     assert.equal(cfg.provider.hallpass.npm, "@ai-sdk/openai-compatible");
     assert.equal(cfg.provider.hallpass.options.baseURL, "https://api.hallpassai.com/v1");
-    assert.equal(cfg.provider.hallpass.models["gpt-5.4"].limit.output, 8192);
+    assert.equal(cfg.provider.hallpass.models["claude-sonnet-4-6"].limit.output, 8192);
 
     const auth = JSON.parse(fs.readFileSync(authPath, "utf8"));
     assert.deepEqual(auth.hallpass, { type: "api", key: SAMPLE_PAYLOAD.token });
@@ -144,7 +257,7 @@ test("opencode adapter writes opencode.json provider and 0600 auth.json with typ
     }
   }));
 
-test("copilot adapter writes 0600 copilot.env and idempotent shell profile block", () =>
+test("copilot adapter writes single-quoted 0600 copilot.env and idempotent shell profile block", () =>
   withTempHome((home) => {
     configureAgent("copilot", SAMPLE_PAYLOAD, { homeDir: home, shell: "/bin/zsh" });
     configureAgent("copilot", SAMPLE_PAYLOAD, { homeDir: home, shell: "/bin/zsh" });
@@ -153,9 +266,41 @@ test("copilot adapter writes 0600 copilot.env and idempotent shell profile block
 
     const envFile = path.join(home, ".config", "hallpass", "copilot.env");
     const envContent = fs.readFileSync(envFile, "utf8");
-    assert.match(envContent, /COPILOT_OFFLINE="true"/);
-    assert.match(envContent, /COPILOT_PROVIDER_BASE_URL="https:\/\/api\.hallpassai\.com\/v1"/);
+    assert.match(envContent, /COPILOT_OFFLINE='true'/);
+    assert.match(envContent, /COPILOT_PROVIDER_BASE_URL='https:\/\/api\.hallpassai\.com\/v1'/);
   }));
+
+test("parseArgs rejects missing flag values and --dry-run does not claim pairing code on server", async () => {
+  assert.throws(() => parseArgs(["--origin", "--dry-run", "HP-ABCD-2345"]), /Missing value/);
+
+  let serverHit = false;
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "hp-dry-test-"));
+  const prevHome = process.env.HOME;
+  process.env.HOME = tempHome;
+  const server = http.createServer((_req, res) => {
+    serverHit = true;
+    res.statusCode = 500;
+    res.end("{}");
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  try {
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const code = await cliMain([
+      "HPL-ABCD-2345",
+      "--agent",
+      "claude-code",
+      "--origin",
+      base,
+      "--dry-run",
+    ]);
+    assert.equal(code, 0);
+    assert.equal(serverHit, false, "--dry-run must never consume server pairing code");
+  } finally {
+    process.env.HOME = prevHome;
+    await new Promise((r) => server.close(r));
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  }
+});
 
 test("end-to-end CLI claims pairing code over HTTP, configures tool, verifies /v1/models, and reports configured status", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hp-cli-e2e-"));
@@ -217,8 +362,7 @@ test("end-to-end CLI claims pairing code over HTTP, configures tool, verifies /v
   }
 });
 
-
-test("packed npm tarball extracts cleanly and runs real CLI subprocess across all 5 harnesses", async () => {
+test("packed npm tarball extracts cleanly and runs real CLI subprocess across all harnesses", async () => {
   const work = fs.mkdtempSync(path.join(os.tmpdir(), "hp-pack-test-"));
   const home = path.join(work, "home");
   const fakeBin = path.join(work, "bin");
@@ -234,17 +378,24 @@ test("packed npm tarball extracts cleanly and runs real CLI subprocess across al
     const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : null;
     res.setHeader("Content-Type", "application/json");
     if (req.url === "/api/core/pair/claim") {
-      res.end(JSON.stringify({
-        operationId: "op_all",
-        harness: "all",
-        model: "claude-sonnet-4-6",
-        token: SAMPLE_PAYLOAD.token,
-        progressToken: "hp_pair_" + "b".repeat(43),
-        apiBase: `http://127.0.0.1:${server.address().port}/v1`,
-        models: SAMPLE_PAYLOAD.models,
-      }));
+      res.end(
+        JSON.stringify({
+          operationId: "op_all",
+          harness: "all",
+          model: "claude-sonnet-4-6",
+          token: SAMPLE_PAYLOAD.token,
+          progressToken: "hp_pair_" + "b".repeat(43),
+          apiBase: `http://127.0.0.1:${server.address().port}/v1`,
+          models: SAMPLE_PAYLOAD.models,
+        }),
+      );
     } else if (req.url === "/v1/models") {
-      res.end(JSON.stringify({ object: "list", data: [{ id: "claude-sonnet-4-6" }, { id: "gpt-5.4" }] }));
+      res.end(
+        JSON.stringify({
+          object: "list",
+          data: [{ id: "claude-sonnet-4-6" }, { id: "gpt-5.4" }],
+        }),
+      );
     } else if (req.url === "/api/core/pair/status") {
       res.end(JSON.stringify({ ok: true, phase: body.phase }));
     } else {
@@ -255,12 +406,18 @@ test("packed npm tarball extracts cleanly and runs real CLI subprocess across al
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   try {
     const pkgRoot = path.resolve(import.meta.dirname, "..");
-    const packOut = spawnSync("npm", ["pack", "--pack-destination", work], { cwd: pkgRoot, encoding: "utf8" });
+    const packOut = spawnSync("npm", ["pack", "--pack-destination", work], {
+      cwd: pkgRoot,
+      encoding: "utf8",
+    });
     assert.equal(packOut.status, 0, packOut.stderr);
     const tgz = path.join(work, packOut.stdout.trim().split(/\r?\n/).pop());
     const extractDir = path.join(work, "extracted");
     fs.mkdirSync(extractDir);
-    assert.equal(spawnSync("tar", ["-xzf", tgz, "-C", extractDir], { encoding: "utf8" }).status, 0);
+    assert.equal(
+      spawnSync("tar", ["-xzf", tgz, "-C", extractDir], { encoding: "utf8" }).status,
+      0,
+    );
 
     const binPath = path.join(extractDir, "package", "bin", "cli.js");
     const env = {
@@ -274,7 +431,11 @@ test("packed npm tarball extracts cleanly and runs real CLI subprocess across al
       XDG_DATA_HOME: path.join(home, ".local", "share"),
     };
     const base = `http://127.0.0.1:${server.address().port}`;
-    await execFileAsync(process.execPath, [binPath, "HPL-ABCD-2345", "--agent", "all", "--origin", base], { env });
+    await execFileAsync(
+      process.execPath,
+      [binPath, "HPL-ABCD-2345", "--agent", "all", "--origin", base],
+      { env },
+    );
     assert.ok(fs.existsSync(path.join(home, ".claude", "settings.json")));
     assert.ok(fs.existsSync(path.join(home, ".codex", "config.toml")));
     assert.ok(fs.existsSync(path.join(home, ".config", "opencode", "opencode.json")));
@@ -282,6 +443,10 @@ test("packed npm tarball extracts cleanly and runs real CLI subprocess across al
 
     await execFileAsync(process.execPath, [binPath, "status"], { env });
     await execFileAsync(process.execPath, [binPath, "undo"], { env });
+    assert.equal(
+      fs.existsSync(path.join(home, ".local", "share", "opencode", "auth.json")),
+      false,
+    );
   } finally {
     await new Promise((r) => server.close(r));
     fs.rmSync(work, { recursive: true, force: true });

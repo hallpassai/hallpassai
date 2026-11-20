@@ -5,10 +5,14 @@ export {
   undoAgent,
   upsertCodexToml,
   upsertShellBlock,
+  shSingleQuote,
+  stripJsonc,
 } from "./adapters.js";
 export {
   normalizeCode,
   resolveOrigin,
+  validateEndpointUrl,
+  validateClaimPayload,
   claimCode,
   verifyGatewayReachable,
   sendPairingStatus,

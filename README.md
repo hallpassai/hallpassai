@@ -41,7 +41,7 @@ Every modified configuration file is backed up to `<file>.hallpass.bak` first.
 # Pair and configure a tool (or all detected tools)
 npx hallpassai@latest HP-XXXX-XXXX
 
-# Preview file changes without modifying disk
+# Preview file changes locally without consuming the pairing code or modifying disk
 npx hallpassai@latest HP-XXXX-XXXX --dry-run
 
 # Check configured tools and verify API key health (uses 0 credits)

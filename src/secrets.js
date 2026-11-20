@@ -1,12 +1,51 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
+
+const KNOWN_HARNESSES = [
+  "claude-code",
+  "codex",
+  "opencode",
+  "copilot",
+  "cursor",
+  "default",
+  "all",
+];
+
+export function assertNotSymlink(targetPath) {
+  try {
+    if (fs.lstatSync(targetPath).isSymbolicLink()) {
+      throw new Error(`Refusing to follow or overwrite symlink: ${targetPath}`);
+    }
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+}
+
+function restrictWindowsAcl(targetPath, isDir = false) {
+  if (process.platform !== "win32") return;
+  try {
+    const icacls = path.join(
+      process.env.SystemRoot || "C:\\Windows",
+      "System32",
+      "icacls.exe",
+    );
+    const perm = isDir ? "(OI)(CI)F" : "(F)";
+    const user = os.userInfo().username;
+    spawnSync(
+      icacls,
+      [targetPath, "/inheritance:r", "/grant:r", `${user}:${perm}`],
+      { stdio: "ignore", timeout: 4000 },
+    );
+  } catch {}
+}
 
 export function hallpassDir(homeDir = os.homedir()) {
   const xdg = process.env.HALLPASS_CONFIG_DIR;
-  if (xdg) return xdg;
-  return path.join(homeDir, ".config", "hallpass");
+  if (xdg && path.isAbsolute(xdg)) return path.resolve(xdg);
+  return path.join(path.resolve(homeDir), ".config", "hallpass");
 }
 
 export function credentialsPath(homeDir = os.homedir()) {
@@ -17,29 +56,71 @@ export function helperScriptPath(homeDir = os.homedir()) {
   return path.join(hallpassDir(homeDir), "read-key.mjs");
 }
 
-function ensurePrivateDir(dir) {
+export function ensurePrivateDir(dir) {
+  assertNotSymlink(dir);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   try {
     fs.chmodSync(dir, 0o700);
   } catch {}
+  restrictWindowsAcl(dir, true);
 }
 
 export function writePrivateFile(filePath, content, mode = 0o600) {
-  ensurePrivateDir(path.dirname(filePath));
-  const tmp = `${filePath}.tmp.${process.pid}`;
-  fs.writeFileSync(tmp, content, { mode });
+  assertNotSymlink(filePath);
+  const parent = path.dirname(filePath);
+  if ((mode & 0o077) === 0) {
+    ensurePrivateDir(parent);
+  } else {
+    assertNotSymlink(parent);
+    fs.mkdirSync(parent, { recursive: true });
+  }
+  const nonce = crypto.randomBytes(8).toString("hex");
+  const tmp = `${filePath}.tmp.${process.pid}.${nonce}`;
+  const flags =
+    fs.constants.O_CREAT |
+    fs.constants.O_EXCL |
+    fs.constants.O_WRONLY |
+    (fs.constants.O_NOFOLLOW || 0);
+  let fd;
   try {
-    fs.chmodSync(tmp, mode);
-  } catch {}
-  fs.renameSync(tmp, filePath);
+    fd = fs.openSync(tmp, flags, mode);
+    try {
+      fs.fchmodSync(fd, mode);
+    } catch {}
+    if (Buffer.isBuffer(content)) {
+      fs.writeFileSync(fd, content);
+    } else {
+      fs.writeFileSync(fd, content, "utf8");
+    }
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    if ((mode & 0o077) === 0) restrictWindowsAcl(tmp, false);
+    fs.renameSync(tmp, filePath);
+  } catch (err) {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+    try {
+      fs.unlinkSync(tmp);
+    } catch {}
+    throw err;
+  }
 }
 
 export function readStoredCredentials(homeDir = os.homedir()) {
   const fp = credentialsPath(homeDir);
   if (!fs.existsSync(fp)) return { keys: {} };
   try {
+    assertNotSymlink(fp);
     const parsed = JSON.parse(fs.readFileSync(fp, "utf8"));
-    return parsed && typeof parsed === "object" && parsed.keys
+    return parsed &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      parsed.keys &&
+      typeof parsed.keys === "object"
       ? parsed
       : { keys: {} };
   } catch {
@@ -52,6 +133,9 @@ export function storeCredential(
   { token, apiBase, model },
   { homeDir = os.homedir(), useKeychain = process.platform === "darwin" } = {},
 ) {
+  if (!/^[a-z0-9-]+$/.test(harness)) {
+    throw new Error(`Invalid harness identifier: ${harness}`);
+  }
   const dir = hallpassDir(homeDir);
   ensurePrivateDir(dir);
 
@@ -61,20 +145,13 @@ export function storeCredential(
     process.env.HALLPASS_DISABLE_KEYCHAIN !== "1" &&
     homeDir === os.homedir()
   ) {
-    const res = spawnSync(
-      "security",
-      [
-        "add-generic-password",
-        "-U",
-        "-a",
-        harness,
-        "-s",
-        "hallpassai",
-        "-w",
-        token,
-      ],
-      { stdio: "ignore" },
-    );
+    // Pass hex-encoded secret via stdin (`security -i`) so raw tokens never appear in process argv (`ps aux`).
+    const hexToken = Buffer.from(String(token), "utf8").toString("hex");
+    const res = spawnSync("/usr/bin/security", ["-i"], {
+      input: `add-generic-password -U -a ${harness} -s hallpassai -X ${hexToken}\n`,
+      stdio: ["pipe", "ignore", "ignore"],
+      timeout: 5000,
+    });
     storedInKeychain = res.status === 0;
   }
 
@@ -100,20 +177,32 @@ export function removeCredential(
   harness,
   { homeDir = os.homedir(), useKeychain = process.platform === "darwin" } = {},
 ) {
+  const fp = credentialsPath(homeDir);
+  const current = fs.existsSync(fp)
+    ? readStoredCredentials(homeDir)
+    : { keys: {} };
+  const targets =
+    harness === "all"
+      ? Array.from(
+          new Set([...KNOWN_HARNESSES, ...Object.keys(current.keys || {})]),
+        )
+      : [harness];
+
   if (
     useKeychain &&
     process.env.HALLPASS_DISABLE_KEYCHAIN !== "1" &&
     homeDir === os.homedir()
   ) {
-    spawnSync(
-      "security",
-      ["delete-generic-password", "-a", harness, "-s", "hallpassai"],
-      { stdio: "ignore" },
-    );
+    for (const acct of targets) {
+      if (!/^[a-z0-9-]+$/.test(acct)) continue;
+      spawnSync(
+        "/usr/bin/security",
+        ["delete-generic-password", "-a", acct, "-s", "hallpassai"],
+        { stdio: "ignore", timeout: 4000 },
+      );
+    }
   }
-  const fp = credentialsPath(homeDir);
   if (!fs.existsSync(fp)) return;
-  const current = readStoredCredentials(homeDir);
   if (harness === "all") current.keys = {};
   else delete current.keys[harness];
   writePrivateFile(fp, JSON.stringify(current, null, 2) + "\n", 0o600);
@@ -123,22 +212,34 @@ export function ensureHelperScript(homeDir = os.homedir()) {
   const script = `#!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
 const harness = process.argv[2] || "default";
+if (!/^[a-z0-9-]+$/.test(harness)) process.exit(1);
+
 if (process.platform === "darwin" && process.env.HALLPASS_DISABLE_KEYCHAIN !== "1") {
-  const kc = spawnSync("security", ["find-generic-password", "-a", harness, "-s", "hallpassai", "-w"], { encoding: "utf8" });
+  const kc = spawnSync("/usr/bin/security", ["find-generic-password", "-a", harness, "-s", "hallpassai", "-w"], {
+    encoding: "utf8",
+    timeout: 4000,
+  });
   if (kc.status === 0 && kc.stdout.trim()) {
     process.stdout.write(kc.stdout.trim());
     process.exit(0);
   }
 }
-const credPath = path.join(path.dirname(new URL(import.meta.url).pathname), "credentials.json");
+const credPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "credentials.json");
 const data = JSON.parse(fs.readFileSync(credPath, "utf8"));
-const entry = data?.keys?.[harness] || data?.keys?.all || Object.values(data?.keys || {})[0];
+const keys = data && typeof data.keys === "object" ? data.keys : {};
+const entry = Object.hasOwn(keys, harness)
+  ? keys[harness]
+  : Object.hasOwn(keys, "all")
+    ? keys.all
+    : null;
 if (!entry?.token) process.exit(1);
 process.stdout.write(entry.token);
 `;
-  writePrivateFile(helperScriptPath(homeDir), script, 0o700);
-  return helperScriptPath(homeDir);
+  const target = helperScriptPath(homeDir);
+  writePrivateFile(target, script, 0o700);
+  return target;
 }

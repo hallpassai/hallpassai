@@ -12,6 +12,7 @@ import {
 } from "../src/adapters.js";
 import {
   normalizeCode,
+  resolveOrigin,
   claimCode,
   verifyGatewayReachable,
   sendPairingStatus,
@@ -21,6 +22,15 @@ import { readStoredCredentials } from "../src/secrets.js";
 const require = createRequire(import.meta.url);
 const pkg = require("../package.json");
 
+const cleanLog = (s) => {
+  const str = String(s ?? "");
+  let out = "";
+  for (let i = 0; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+    if ((code >= 0x20 && code < 0x7f) || code >= 0xa0) out += str[i];
+  }
+  return out;
+};
 const green = (s) => (process.stdout.isTTY ? `\x1b[32m${s}\x1b[0m` : s);
 const dim = (s) => (process.stdout.isTTY ? `\x1b[2m${s}\x1b[0m` : s);
 const bold = (s) => (process.stdout.isTTY ? `\x1b[1m${s}\x1b[0m` : s);
@@ -36,15 +46,21 @@ ${bold("Usage:")}
 
 ${bold("Options:")}
   --agent <name>   Override target tool (${SUPPORTED_AGENTS.join(", ")})
-  --dry-run        Preview configuration changes without writing files
+  --dry-run        Preview configuration changes without claiming code or writing files
   --origin <url>   Override HallPass server origin
   -h, --help       Show help
   -v, --version    Show version
 `);
 }
 
-function parseArgs(argv) {
-  const out = { command: null, code: null, agent: null, dryRun: false, origin: null };
+export function parseArgs(argv) {
+  const out = {
+    command: null,
+    code: null,
+    agent: null,
+    dryRun: false,
+    origin: null,
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "-h" || a === "--help" || a === "help") {
@@ -59,20 +75,30 @@ function parseArgs(argv) {
       out.dryRun = true;
       continue;
     }
-    if (a === "--agent" && argv[i + 1]) {
-      out.agent = argv[++i];
+    if (a === "--agent") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        throw new Error("Missing value for --agent.");
+      }
+      out.agent = next;
       continue;
     }
     if (a.startsWith("--agent=")) {
       out.agent = a.slice(8);
+      if (!out.agent) throw new Error("Missing value for --agent.");
       continue;
     }
-    if (a === "--origin" && argv[i + 1]) {
-      out.origin = argv[++i];
+    if (a === "--origin") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        throw new Error("Missing value for --origin.");
+      }
+      out.origin = next;
       continue;
     }
     if (a.startsWith("--origin=")) {
       out.origin = a.slice(9);
+      if (!out.origin) throw new Error("Missing value for --origin.");
       continue;
     }
     if (!out.command && ["connect", "pair", "status", "undo"].includes(a)) {
@@ -86,15 +112,20 @@ function parseArgs(argv) {
 }
 
 async function runCursorInteractive(values) {
-  console.log(`\n${bold("Cursor setup (3 quick fields in Cursor → Settings → Models):")}`);
-  const copiedKey = copyToClipboard(values.apiKey);
   console.log(
-    `  1. ${bold("OpenAI API Key:")} ${values.apiKey.slice(0, 15)}•••••• ${copiedKey ? green("(✓ copied to clipboard)") : ""}`,
+    `\n${bold("Cursor setup (3 quick fields in Cursor → Settings → Models):")}`,
   );
-  console.log(`  2. ${bold("Override OpenAI Base URL:")} ${values.baseUrl}`);
-  console.log(`  3. ${bold("Model ID:")} ${values.model}`);
+  const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  const copiedKey = interactive ? copyToClipboard(values.apiKey) : false;
+  console.log(
+    `  1. ${bold("OpenAI API Key:")} ${cleanLog(values.apiKey.slice(0, 15))}•••••• ${copiedKey ? green("(✓ copied to clipboard)") : ""}`,
+  );
+  console.log(
+    `  2. ${bold("Override OpenAI Base URL:")} ${cleanLog(values.baseUrl)}`,
+  );
+  console.log(`  3. ${bold("Model ID:")} ${cleanLog(values.model)}`);
 
-  if (process.stdin.isTTY && process.stdout.isTTY) {
+  if (interactive) {
     const rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
@@ -104,12 +135,12 @@ async function runCursorInteractive(values) {
         dim("\n  Press Enter after pasting the API key to copy the Base URL… "),
       );
       if (copyToClipboard(values.baseUrl))
-        console.log(`  ${green("✓")} Copied Base URL: ${values.baseUrl}`);
+        console.log(`  ${green("✓")} Copied Base URL: ${cleanLog(values.baseUrl)}`);
       await rl.question(
         dim("  Press Enter after pasting Base URL to copy the Model ID… "),
       );
       if (copyToClipboard(values.model))
-        console.log(`  ${green("✓")} Copied Model ID: ${values.model}`);
+        console.log(`  ${green("✓")} Copied Model ID: ${cleanLog(values.model)}`);
     } finally {
       rl.close();
     }
@@ -127,8 +158,12 @@ export async function main(argv = process.argv.slice(2)) {
     return 0;
   }
   if (args.command === "undo") {
-    if (args.agent && args.agent !== "all" && !SUPPORTED_AGENTS.includes(args.agent)) {
-      console.error(red(`Unknown agent: ${args.agent}`));
+    if (
+      args.agent &&
+      args.agent !== "all" &&
+      !SUPPORTED_AGENTS.includes(args.agent)
+    ) {
+      console.error(red(`Unknown agent: ${cleanLog(args.agent)}`));
       return 1;
     }
     const restored = undoAgent(args.agent || "all");
@@ -144,7 +179,9 @@ export async function main(argv = process.argv.slice(2)) {
     const entries = Object.entries(creds.keys || {});
     if (!entries.length) {
       console.log("No HallPass tools configured on this machine yet.");
-      console.log("Generate a pairing code at https://app.hallpassai.com/start.html#connect");
+      console.log(
+        "Generate a pairing code at https://app.hallpassai.com/start.html#connect",
+      );
       return 0;
     }
     for (const [agent, info] of entries) {
@@ -153,23 +190,70 @@ export async function main(argv = process.argv.slice(2)) {
         token: info.token,
       });
       console.log(
-        `${ok ? green("✓") : red("✗")} ${bold(agent)} — model: ${info.model} · endpoint: ${info.apiBase} · key: ${ok ? "active" : "invalid or unreachable"}`,
+        `${ok ? green("✓") : red("✗")} ${bold(cleanLog(agent))} — model: ${cleanLog(info.model)} · endpoint: ${cleanLog(info.apiBase)} · key: ${ok ? "active" : "invalid or unreachable"}`,
       );
     }
     return 0;
   }
 
-  if (!args.code || !normalizeCode(args.code)) {
+  const parsedCode = args.code ? normalizeCode(args.code) : null;
+  if (!parsedCode) {
     console.error(
       red("Please provide a valid pairing code (e.g. `npx hallpassai HP-XXXX-XXXX`)."),
     );
     return 1;
   }
-  if (args.agent && args.agent !== "all" && !SUPPORTED_AGENTS.includes(args.agent)) {
+  if (
+    args.agent &&
+    args.agent !== "all" &&
+    !SUPPORTED_AGENTS.includes(args.agent)
+  ) {
     console.error(
-      red(`Unsupported --agent "${args.agent}". Choose one of: ${SUPPORTED_AGENTS.join(", ")}`),
+      red(
+        `Unsupported --agent "${cleanLog(args.agent)}". Choose one of: ${SUPPORTED_AGENTS.join(", ")}`,
+      ),
     );
     return 1;
+  }
+
+  // Dry-run previews local adapter output WITHOUT consuming the single-use server pairing code or rotating live keys.
+  if (args.dryRun) {
+    const resolvedOrigin = resolveOrigin(parsedCode.prefix, args.origin);
+    const previewApiBase =
+      resolvedOrigin === "https://app.hallpassai.com"
+        ? "https://api.hallpassai.com/v1"
+        : `${resolvedOrigin}/v1`;
+    const targetHarness = args.agent || "all";
+    const agents =
+      targetHarness === "all" ? detectInstalledAgents() : [targetHarness];
+    const previewPayload = {
+      token: "hp_live_••••••••",
+      apiBase: previewApiBase,
+      model: "claude-sonnet-4-6",
+      models: [
+        {
+          id: "claude-sonnet-4-6",
+          name: "Claude Sonnet 4.6",
+          protocols: ["messages", "chat/completions"],
+        },
+        {
+          id: "gpt-5.4",
+          name: "GPT-5.4",
+          protocols: ["responses", "chat/completions"],
+        },
+      ],
+    };
+    console.log(
+      `${dim("→")} Previewing HallPass setup (pairing code ${parsedCode.code} NOT consumed)…`,
+    );
+    for (const agent of agents) {
+      const res = configureAgent(agent, previewPayload, { dryRun: true });
+      console.log(
+        `\n${bold(`[dry-run] ${agent}`)}${res.files.length ? ` (${res.files.join(", ")})` : ""}:`,
+      );
+      if (res.preview) console.log(res.preview);
+    }
+    return 0;
   }
 
   console.log(`${dim("→")} Claiming HallPass pairing code…`);
@@ -180,35 +264,28 @@ export async function main(argv = process.argv.slice(2)) {
 
   try {
     for (const agent of agents) {
-      const res = configureAgent(agent, claimed, { dryRun: args.dryRun });
-      if (args.dryRun) {
-        console.log(`\n${bold(`[dry-run] ${agent}`)} (${res.files.join(", ")}):`);
-        if (res.preview) console.log(res.preview);
-        continue;
-      }
+      const res = configureAgent(agent, claimed, { dryRun: false });
       if (res.cursorValues) {
         await runCursorInteractive(res.cursorValues);
       } else {
-        console.log(`${green("✓")} Configured ${bold(agent)}`);
+        console.log(`${green("✓")} Configured ${bold(cleanLog(agent))}`);
         for (const f of res.files) console.log(`  ${dim("updated")} ${f}`);
         if (res.backup) console.log(`  ${dim("backup")}  ${res.backup}`);
       }
       console.log(`\n${bold("Next:")} ${res.nextStep}`);
     }
 
-    if (!args.dryRun) {
-      const reachable = await verifyGatewayReachable(claimed);
-      if (reachable) {
-        console.log(
-          `${dim("✓ Verified gateway connection (0 credits used). Undo anytime with `npx hallpassai undo`.")}`,
-        );
-      }
-      await sendPairingStatus({
-        origin: claimed.resolvedOrigin,
-        progressToken: claimed.progressToken,
-        phase: "configured",
-      });
+    const reachable = await verifyGatewayReachable(claimed);
+    if (reachable) {
+      console.log(
+        `${dim("✓ Verified gateway connection (0 credits used). Undo anytime with `npx hallpassai undo`.")}`,
+      );
     }
+    await sendPairingStatus({
+      origin: claimed.resolvedOrigin,
+      progressToken: claimed.progressToken,
+      phase: "configured",
+    });
     return 0;
   } catch (err) {
     await sendPairingStatus({
@@ -238,7 +315,7 @@ if (isMain) {
       process.exitCode = code;
     },
     (err) => {
-      console.error(red(`✗ ${err.message || err}`));
+      console.error(red(`✗ ${cleanLog(err?.message || err)}`));
       process.exitCode = 1;
     },
   );
