@@ -1,6 +1,6 @@
 {
   "name": "hallpassai",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "One-command setup connector for HallPass AI API gateway (Claude Code, Codex, OpenCode, Copilot CLI, Cursor).",
   "license": "MIT",
   "type": "module",

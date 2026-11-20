@@ -168,7 +168,8 @@ function stripHallpassFromCodexToml(existingToml, { removeTopLevelProvider = fal
       if (
         i < limit &&
         (/^\s*model_provider\s*=\s*"hallpass"\s*(?:#.*)?$/.test(kept[i]) ||
-          (hadHallpassProvider && /^\s*model\s*=/.test(kept[i])))
+          (hadHallpassProvider && /^\s*model\s*=/.test(kept[i])) ||
+          (hadHallpassProvider && /^\s*web_search\s*=\s*"disabled"\s*(?:#.*)?$/.test(kept[i])))
       ) {
         continue;
       }
@@ -192,6 +193,7 @@ export function upsertCodexToml(
   const limit = firstSectionIdx === -1 ? kept.length : firstSectionIdx;
   let sawModel = false;
   let sawProvider = false;
+  let sawWebSearch = false;
   for (let i = 0; i < limit; i++) {
     if (/^\s*model\s*=/.test(kept[i])) {
       kept[i] = `model = ${tomlBasicString(model)}`;
@@ -199,11 +201,15 @@ export function upsertCodexToml(
     } else if (/^\s*model_provider\s*=/.test(kept[i])) {
       kept[i] = `model_provider = "hallpass"`;
       sawProvider = true;
+    } else if (/^\s*web_search\s*=/.test(kept[i])) {
+      kept[i] = `web_search = "disabled"`;
+      sawWebSearch = true;
     }
   }
   const topInserts = [];
   if (!sawModel) topInserts.push(`model = ${tomlBasicString(model)}`);
   if (!sawProvider) topInserts.push(`model_provider = "hallpass"`);
+  if (!sawWebSearch) topInserts.push(`web_search = "disabled"`);
   if (topInserts.length) {
     kept.splice(
       0,
@@ -406,7 +412,7 @@ export function configureAgent(
         continue;
       modelEntries[m.id] = {
         name: m.name || m.id,
-        limit: { output: 8192 },
+        limit: { context: 128000, output: 8192 },
       };
     }
 
@@ -473,6 +479,7 @@ export function configureAgent(
       `export COPILOT_PROVIDER_BASE_URL=${shSingleQuote(apiBase)}`,
       `export COPILOT_PROVIDER_API_KEY=${shSingleQuote(effectiveToken)}`,
       `export COPILOT_MODEL=${shSingleQuote(chosenModel)}`,
+      `export COPILOT_PROVIDER_MAX_OUTPUT_TOKENS='8192'`,
       "",
     ].join("\n");
 

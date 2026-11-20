@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import http from "node:http";
+import { fileURLToPath } from "node:url";
 import { spawnSync, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
@@ -232,8 +233,9 @@ test("codex adapter preserves [[array_of_tables]] & commented sections and runs 
 
     // Execute generated read-key.mjs inside spaced directory path
     const helper = helperScriptPath(home);
+    const { NODE_TEST_CONTEXT: _ntc1, ...cleanEnv1 } = process.env;
     const out = spawnSync(process.execPath, [helper, "codex"], {
-      env: { ...process.env, HALLPASS_DISABLE_KEYCHAIN: "1" },
+      env: { ...cleanEnv1, HALLPASS_DISABLE_KEYCHAIN: "1" },
       encoding: "utf8",
     });
     assert.equal(out.status, 0);
@@ -248,7 +250,10 @@ test("opencode adapter writes opencode.json provider and 0600 auth.json with typ
     const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
     assert.equal(cfg.provider.hallpass.npm, "@ai-sdk/openai-compatible");
     assert.equal(cfg.provider.hallpass.options.baseURL, "https://api.hallpassai.com/v1");
-    assert.equal(cfg.provider.hallpass.models["claude-sonnet-4-6"].limit.output, 8192);
+    assert.deepEqual(cfg.provider.hallpass.models["claude-sonnet-4-6"].limit, {
+      context: 128000,
+      output: 8192,
+    });
 
     const auth = JSON.parse(fs.readFileSync(authPath, "utf8"));
     assert.deepEqual(auth.hallpass, { type: "api", key: SAMPLE_PAYLOAD.token });
@@ -405,9 +410,14 @@ test("packed npm tarball extracts cleanly and runs real CLI subprocess across al
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   try {
-    const pkgRoot = path.resolve(import.meta.dirname, "..");
+    const pkgRoot = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "..",
+    );
+    const { NODE_TEST_CONTEXT: _ntc2, ...cleanEnv } = process.env;
     const packOut = spawnSync("npm", ["pack", "--pack-destination", work], {
       cwd: pkgRoot,
+      env: cleanEnv,
       encoding: "utf8",
     });
     assert.equal(packOut.status, 0, packOut.stderr);
@@ -421,7 +431,7 @@ test("packed npm tarball extracts cleanly and runs real CLI subprocess across al
 
     const binPath = path.join(extractDir, "package", "bin", "cli.js");
     const env = {
-      ...process.env,
+      ...cleanEnv,
       HOME: home,
       PATH: `${fakeBin}:${process.env.PATH}`,
       SHELL: "/bin/zsh",
