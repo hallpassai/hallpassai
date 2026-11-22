@@ -320,7 +320,7 @@ if (!/^[a-z0-9-]+$/.test(harness)) process.exit(1);
 if (process.platform === "darwin" && process.env.HALLPASS_DISABLE_KEYCHAIN !== "1") {
   const kc = spawnSync("/usr/bin/security", ["find-generic-password", "-a", harness, "-s", "hallpassai", "-w"], {
     encoding: "utf8",
-    timeout: 4000,
+    timeout: 2500,
   });
   if (kc.status === 0 && kc.stdout.trim()) {
     process.stdout.write(kc.stdout.trim());

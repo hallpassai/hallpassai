@@ -181,6 +181,9 @@ export function validateClaimPayload(body, resolvedOrigin) {
           ...(Number.isInteger(m.contextLength) && m.contextLength > 0
             ? { contextLength: m.contextLength }
             : {}),
+          ...(Number.isInteger(m.maxOutputTokens) && m.maxOutputTokens > 0
+            ? { maxOutputTokens: m.maxOutputTokens }
+            : {}),
           ...(typeof m.inputPerMillion === "number" && Number.isFinite(m.inputPerMillion) && m.inputPerMillion >= 0
             ? { inputPerMillion: m.inputPerMillion }
             : {}),
@@ -393,6 +396,10 @@ export async function fetchCatalogDetails(
             contextLength:
               Number.isInteger(m.contextLength) && m.contextLength > 0
                 ? m.contextLength
+                : undefined,
+            maxOutputTokens:
+              Number.isInteger(m.maxOutputTokens) && m.maxOutputTokens > 0
+                ? m.maxOutputTokens
                 : undefined,
             ...(typeof m.inputPerMillion === "number" && Number.isFinite(m.inputPerMillion) && m.inputPerMillion >= 0
               ? { inputPerMillion: m.inputPerMillion }

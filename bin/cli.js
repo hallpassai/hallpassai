@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import http from "node:http";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import readline from "node:readline/promises";
-import { spawnSync } from "node:child_process";
+import { emitKeypressEvents } from "node:readline";
+import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import {
@@ -102,29 +105,26 @@ function isInteractiveTerminal({
 }
 
 function printHelp() {
-  console.log(`${bold("hallpassai")} v${pkg.version} — One-command setup for HallPass AI Gateway
+  console.log(`${bold("hallpassai")} v${pkg.version} — Connect your coding tools to HallPass
 
 ${bold("Usage:")}
-  npx hallpassai@latest <PAIRING-CODE> [--coexist] [--reasoning <level>]
-  npx hallpassai@latest run [MODEL-ID] [--agent <name>] [-- <tool-args...>]
-  npx hallpassai@latest add <MODEL-ID> [--agent <name>]
-  npx hallpassai@latest use [MODEL-ID] [--reasoning <level>] [--agent <name>]
-  npx hallpassai@latest pause | resume [--agent <name>]
-  npx hallpassai@latest status | usage [--json]
-  npx hallpassai@latest models [--provider <name>] [--search <query>]
-  npx hallpassai@latest doctor
-  npx hallpassai@latest undo [--agent <name>]
-  npx hallpassai@latest uninstall [--agent <name>] [--keep-keys]
+  npx hallpassai auth [PAIRING-CODE] [--harness <name>]
+  npx hallpassai add [MODEL-ID] [--harness <name>]
+  npx hallpassai models [--provider <name>] [--search <query>]
+  npx hallpassai use [MODEL-ID] [-r <level>] [--harness <name>]
+  npx hallpassai run [HARNESS] [MODEL-ID] [-- <tool-args...>]
+  npx hallpassai pause | resume [--harness <name>]
+  npx hallpassai usage | status | doctor [--json]
+  npx hallpassai uninstall [--harness <name>] [--keep-keys]
 
 ${bold("Options:")}
-  --coexist              Keep existing subscription login intact (adds profile/shim/provider alongside)
-  --mode <mode>          Explicit install mode: default or coexist
-  --launch / --no-launch Auto-launch (or skip prompt to launch) tool after pairing
+  --harness <name>       Target a specific tool (${SUPPORTED_AGENTS.join(", ")})
   -r, --reasoning <lvl>  Set reasoning depth (auto, none, minimal, low, medium, high, max, xhigh, ultra)
-  -m, --model <id>       Explicit model ID for \`use\`, \`add\`, or \`run\`
-  --agent <name>         Target a specific tool (${SUPPORTED_AGENTS.join(", ")})
+  -m, --model <id>       Explicit model ID for \`add\`, \`use\`, or \`run\`
   --provider <name>      Filter \`models\` list by provider (e.g. Anthropic, OpenAI, DeepSeek)
   --search <query>       Search \`models\` list by name or ID
+  --no-browser           Print login URL without opening a browser (for SSH / remote shells)
+  --launch / --no-launch Auto-launch (or skip prompt to launch) tool after auth
   --json                 Output structured JSON for \`usage\` / \`status\`
   --dry-run              Preview configuration changes without claiming code or writing files
   --keep-keys            Keep server API keys active during uninstall (local cleanup only)
@@ -168,6 +168,7 @@ export function parseArgs(argv) {
     agent: null,
     mode: null,
     launch: null,
+    noBrowser: false,
     json: false,
     dryRun: false,
     keepKeys: false,
@@ -190,6 +191,10 @@ export function parseArgs(argv) {
     }
     if (a === "--json") {
       out.json = true;
+      continue;
+    }
+    if (a === "--no-browser") {
+      out.noBrowser = true;
       continue;
     }
     if (a === "--dry-run") {
@@ -232,17 +237,17 @@ export function parseArgs(argv) {
       out.mode = val;
       continue;
     }
-    if (a === "--agent") {
+    if (a === "--harness" || a === "--agent") {
       const next = argv[++i];
       if (!next || next.startsWith("-")) {
-        throw new Error("Missing value for --agent.");
+        throw new Error(`Missing value for ${a}.`);
       }
       out.agent = normalizeAgentName(next);
       continue;
     }
-    if (a.startsWith("--agent=")) {
+    if (a.startsWith("--harness=") || a.startsWith("--agent=")) {
       out.agent = normalizeAgentName(a.slice(a.indexOf("=") + 1));
-      if (!out.agent) throw new Error("Missing value for --agent.");
+      if (!out.agent) throw new Error(`Missing value for ${a.split("=")[0]}.`);
       continue;
     }
     if (a === "-m" || a === "--model") {
@@ -320,6 +325,8 @@ export function parseArgs(argv) {
       }
       if (
         [
+          "auth",
+          "login",
           "connect",
           "pair",
           "status",
@@ -339,23 +346,29 @@ export function parseArgs(argv) {
         ].includes(a)
       ) {
         out.command =
-          a === "model"
-            ? "use"
-            : a === "launch"
-              ? "run"
-              : a === "balance" || a === "credits"
-                ? "usage"
-                : a;
+          a === "login"
+            ? "auth"
+            : a === "model"
+              ? "use"
+              : a === "launch"
+                ? "run"
+                : a === "balance" || a === "credits"
+                  ? "usage"
+                  : a;
         continue;
       }
     }
     if (
-      out.command === "run" &&
-      !out.agent &&
-      SUPPORTED_AGENTS.includes(normalizeAgentName(a))
+      ["run", "pause", "resume", "uninstall", "undo", "status", "doctor", "usage"].includes(
+        out.command,
+      ) &&
+      !out.agent
     ) {
-      out.agent = normalizeAgentName(a);
-      continue;
+      const normalized = normalizeAgentName(a);
+      if (normalized === "all" || SUPPORTED_AGENTS.includes(normalized)) {
+        out.agent = normalized;
+        continue;
+      }
     }
     if ((out.command === "use" || out.command === "add" || out.command === "run") && !out.modelArg) {
       out.modelArg = a;
@@ -376,28 +389,28 @@ async function runCursorInteractive(
   { input = process.stdin, output = process.stdout, interactive } = {},
 ) {
   console.log(
-    `\n${bold("Cursor setup (3 quick fields in Cursor → Settings → Models):")}`,
+    `\n${bold("Cursor setup (Cursor → Settings → Models):")}`,
   );
   const isTty = isInteractiveTerminal({ input, output, interactive });
-  const copiedKey = isTty ? copyToClipboard(values.apiKey) : false;
+  const copiedUrl = isTty ? copyToClipboard(values.baseUrl) : false;
   console.log(
-    `  1. ${bold("OpenAI API Key:")} ${cleanLog(values.apiKey.slice(0, 15))}•••••• ${copiedKey ? green("(✓ copied to clipboard)") : ""}`,
+    `  1. ${bold("Override OpenAI Base URL:")} ${cleanLog(values.baseUrl)}${copiedUrl ? ` ${green("(✓ copied to clipboard)")}` : ""}`,
   );
   console.log(
-    `  2. ${bold("Override OpenAI Base URL:")} ${cleanLog(values.baseUrl)}`,
+    `  2. ${bold("OpenAI API Key:")} ${cleanLog(values.apiKey.slice(0, 15))}•••••• ${dim("(save Base URL first before turning on the key)")}`,
   );
-  console.log(`  3. ${bold("Model ID:")} ${cleanLog(values.model)}`);
+  console.log(`  3. ${bold("Add Custom Model:")} ${cleanLog(values.model)} ${dim("(turn off Auto mode in chat; skip built-in Verify)")}`);
 
-  if (isTty) {
+  if (isTty && copiedUrl) {
     const rl = readline.createInterface({ input, output });
     try {
       await rl.question(
-        dim("\n  Press Enter after pasting the API key to copy the Base URL… "),
+        dim("\n  Press Enter after saving Base URL to copy your API key… "),
       );
-      if (copyToClipboard(values.baseUrl))
-        console.log(`  ${green("✓")} Copied Base URL: ${cleanLog(values.baseUrl)}`);
+      if (copyToClipboard(values.apiKey))
+        console.log(`  ${green("✓")} Copied API Key: ${cleanLog(values.apiKey.slice(0, 15))}••••••`);
       await rl.question(
-        dim("  Press Enter after pasting Base URL to copy the Model ID… "),
+        dim("  Press Enter after pasting API Key to copy the Model ID… "),
       );
       if (copyToClipboard(values.model))
         console.log(`  ${green("✓")} Copied Model ID: ${cleanLog(values.model)}`);
@@ -407,9 +420,454 @@ async function runCursorInteractive(
   }
 }
 
+function isRemoteOrHeadlessEnv(env = process.env) {
+  if (env.SSH_CONNECTION || env.SSH_TTY || env.SSH_CLIENT) return true;
+  if (process.platform === "linux" && !env.DISPLAY && !env.WAYLAND_DISPLAY) {
+    return true;
+  }
+  return false;
+}
+
+function openSystemBrowser(url) {
+  try {
+    const cmd =
+      process.platform === "darwin"
+        ? ["open", [url]]
+        : process.platform === "win32"
+          ? ["cmd", ["/c", "start", "", url]]
+          : ["xdg-open", [url]];
+    const child = spawn(cmd[0], cmd[1], {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.on("error", () => {});
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function safeEqualStrings(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
+}
+
+const AUTH_SUCCESS_HTML = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>HallPass CLI Authorized</title>
+  <style>
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #fafaf7; color: #242521; font: 500 15px/1.6 -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif; }
+    .card { max-width: 420px; padding: 32px; border-radius: 16px; background: #fff; border: 1px solid #dfe2d5; text-align: center; box-shadow: 0 12px 30px rgba(20,22,18,0.06); }
+    .badge { display: inline-grid; place-items: center; width: 42px; height: 42px; border-radius: 12px; background: #e0f580; border: 1px solid #c2d766; color: #2a3816; font-size: 20px; font-weight: 700; margin-bottom: 14px; }
+    h1 { margin: 0 0 8px; font-size: 20px; letter-spacing: -0.4px; }
+    p { margin: 0; color: #555b4d; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="badge">&#10003;</div>
+    <h1>HallPass CLI authorized</h1>
+    <p>You can close this tab and return to your terminal.</p>
+  </div>
+</body>
+</html>`;
+
+export async function runBrowserAuthFlow({
+  origin,
+  agent = null,
+  noBrowser = false,
+  input = process.stdin,
+  output = process.stdout,
+  openBrowser = openSystemBrowser,
+  timeoutMs = 5 * 60 * 1000,
+} = {}) {
+  const state = randomBytes(24).toString("base64url");
+  let resolveDone;
+  let rejectDone;
+  const resultPromise = new Promise((resolve, reject) => {
+    resolveDone = resolve;
+    rejectDone = reject;
+  });
+
+  const server = http.createServer((req, res) => {
+    const reqUrl = new URL(req.url || "/", "http://127.0.0.1");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Cache-Control", "no-store");
+    if (req.method !== "GET" || reqUrl.pathname !== "/callback") {
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("Not found");
+      return;
+    }
+    const gotState = reqUrl.searchParams.get("state") || "";
+    const gotCode = normalizeCode(reqUrl.searchParams.get("code") || "");
+    if (!safeEqualStrings(gotState, state) || !gotCode) {
+      res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("Invalid or expired authorization callback.");
+      return;
+    }
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
+    });
+    res.end(AUTH_SUCCESS_HTML);
+    resolveDone(gotCode.code);
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+
+  const port = server.address().port;
+  const authUrl = new URL("/start.html", origin);
+  authUrl.searchParams.set("cli_port", String(port));
+  authUrl.searchParams.set("cli_state", state);
+  if (agent && agent !== "all") authUrl.searchParams.set("cli_agent", agent);
+  authUrl.hash = "connect";
+
+  const isDefaultOpener = openBrowser === openSystemBrowser;
+  const headless = noBrowser || (isDefaultOpener && isRemoteOrHeadlessEnv());
+  const opened = headless ? false : Boolean(openBrowser(authUrl.href));
+
+  if (opened) {
+    console.log(`${dim("→")} Opening browser to sign in to HallPass…`);
+    console.log(`  ${dim("If it didn't open:")} ${authUrl.href}`);
+  } else {
+    console.log(`${bold("Sign in to HallPass in any browser:")}`);
+    console.log(`  ${authUrl.href}`);
+  }
+  console.log(
+    dim("  Waiting for browser callback (or paste a pairing code from Connect and press Enter)…"),
+  );
+
+  const rl = readline.createInterface({ input, output });
+  let settled = false;
+  const finish = (fn, val) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    try {
+      rl.close();
+    } catch {}
+    server.close();
+    fn(val);
+  };
+
+  rl.on("line", (line) => {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) return;
+    const parsed = normalizeCode(trimmed);
+    if (parsed) {
+      finish(resolveDone, parsed.code);
+    } else {
+      console.log(
+        dim("  Not a valid pairing code (expected HP-XXXX-XXXX). Waiting for browser callback…"),
+      );
+    }
+  });
+
+  const timer = setTimeout(() => {
+    finish(
+      rejectDone,
+      new Error(
+        "Timed out waiting for browser authorization. Run `npx hallpassai auth` again or pass a code with `npx hallpassai auth <CODE>`.",
+      ),
+    );
+  }, timeoutMs);
+  timer.unref?.();
+
+  try {
+    const code = await resultPromise;
+    finish(resolveDone, code);
+    return code;
+  } catch (err) {
+    finish(rejectDone, err);
+    throw err;
+  }
+}
+
+export const POPULAR_MODEL_IDS = [
+  "deepseek-v4.1-flash",
+  "claude-opus-5.5",
+  "claude-sonnet-5.5",
+  "gpt-6.1-sol",
+  "gemini-4-carbon",
+  "kimi-k3.1-pro",
+  "qwen3.8-27b",
+  "grok-4.3",
+];
+
+export function orderModelsWithPopularFirst(models = [], topCount = 5) {
+  const byId = new Map();
+  for (const m of models) {
+    if (m?.id && !byId.has(m.id)) byId.set(m.id, m);
+  }
+  const popular = [];
+  const seen = new Set();
+  for (const pid of POPULAR_MODEL_IDS) {
+    if (popular.length >= topCount) break;
+    const hit = byId.get(pid);
+    if (hit) {
+      seen.add(hit.id);
+      popular.push({ ...hit, isPopular: true });
+    }
+  }
+  const rest = [];
+  for (const m of models) {
+    if (!m?.id || seen.has(m.id)) continue;
+    seen.add(m.id);
+    if (popular.length < topCount) {
+      popular.push({ ...m, isPopular: true });
+    } else {
+      rest.push({ ...m, isPopular: false });
+    }
+  }
+  return [...popular, ...rest];
+}
+
+export function filterModelsByQuery(models = [], query = "") {
+  const terms = String(query || "")
+    .toLowerCase()
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (!terms.length) return models;
+  return models.filter((m) => {
+    const hay = `${m.id || ""} ${m.name || ""} ${m.provider || ""}`.toLowerCase();
+    return terms.every((t) => hay.includes(t));
+  });
+}
+
+function formatPickerRow(m, selected) {
+  const ptr = selected ? green("❯") : " ";
+  const idText = selected ? bold(green(cleanLog(m.id))) : cleanLog(m.id);
+  const nameBit =
+    m.name && m.name !== m.id ? ` ${dim(cleanLog(m.name))}` : "";
+  const rate =
+    typeof m.inputPerMillion === "number" &&
+    typeof m.outputPerMillion === "number"
+      ? ` · $${m.inputPerMillion}/$${m.outputPerMillion}`
+      : "";
+  const meta = dim(`${cleanLog(m.provider || "HallPass")}${rate}`);
+  const star = m.isPopular ? yellow(" ★") : "";
+  return `  ${ptr} ${idText}${star}${nameBit} ${dim("·")} ${meta}`;
+}
+
+export async function pickModelInteractive(
+  models,
+  {
+    title = "Select a model to add",
+    input = process.stdin,
+    output = process.stdout,
+    windowSize = 10,
+  } = {},
+) {
+  const ordered = orderModelsWithPopularFirst(models, 5);
+  if (!ordered.length) return null;
+
+  const canUseRawTty =
+    typeof input?.setRawMode === "function" &&
+    Boolean(input?.isTTY) &&
+    Boolean(output?.isTTY);
+
+  if (!canUseRawTty) {
+    const writeLine = (line) => output.write(`${line}\n`);
+    writeLine(`\n${bold(title)} ${dim(`(${ordered.length} available)`)}:`);
+    const top = ordered.slice(0, Math.min(10, ordered.length));
+    top.forEach((m, idx) => {
+      const tag = m.isPopular ? " [popular]" : "";
+      writeLine(`  ${idx + 1}. ${cleanLog(m.id)}${tag} (${cleanLog(m.provider || "HallPass")})`);
+    });
+    const rl = readline.createInterface({ input, output });
+    try {
+      while (true) {
+        const ans = (
+          await rl.question("\nPick a number, type to filter, or enter a model ID (blank to cancel): ")
+        ).trim();
+        if (!ans) return null;
+        const num = Number(ans);
+        if (Number.isInteger(num) && num >= 1 && num <= top.length) {
+          return top[num - 1].id;
+        }
+        const exact = ordered.find((m) => m.id.toLowerCase() === ans.toLowerCase());
+        if (exact) return exact.id;
+        const matches = filterModelsByQuery(ordered, ans);
+        if (matches.length === 1) return matches[0].id;
+        if (!matches.length) {
+          writeLine(`  No models matching "${cleanLog(ans)}". Try again.`);
+          continue;
+        }
+        writeLine(`  Matches (${matches.length}):`);
+        const shown = matches.slice(0, 8);
+        shown.forEach((m, idx) => {
+          writeLine(`    ${idx + 1}. ${cleanLog(m.id)} (${cleanLog(m.provider || "HallPass")})`);
+        });
+        const pick = (await rl.question("  Select number or model ID (blank to search again): ")).trim();
+        if (!pick) continue;
+        const pNum = Number(pick);
+        if (Number.isInteger(pNum) && pNum >= 1 && pNum <= shown.length) {
+          return shown[pNum - 1].id;
+        }
+        const pExact = matches.find((m) => m.id.toLowerCase() === pick.toLowerCase());
+        if (pExact) return pExact.id;
+      }
+    } finally {
+      rl.close();
+    }
+  }
+
+  return new Promise((resolve) => {
+    let query = "";
+    let index = 0;
+    let renderedLines = 0;
+    const prevRaw = Boolean(input.isRaw);
+
+    emitKeypressEvents(input);
+    input.setRawMode(true);
+    input.resume();
+    output.write("\x1b[?25l");
+
+    const render = () => {
+      if (renderedLines > 0) {
+        output.write(`\x1b[${renderedLines}A\r\x1b[J`);
+      }
+      const filtered = filterModelsByQuery(ordered, query);
+      if (index >= filtered.length) index = Math.max(0, filtered.length - 1);
+      if (index < 0) index = 0;
+
+      const lines = [];
+      lines.push(
+        `${bold(title)} ${dim("(↑/↓ cycle · type to filter · Enter select · Esc cancel)")}`,
+      );
+      lines.push(
+        `${dim("Filter:")} ${query ? bold(cleanLog(query)) : dim("type model name or provider…")}`,
+      );
+      lines.push("");
+
+      if (!filtered.length) {
+        lines.push(`  ${dim(`No models match "${cleanLog(query)}". Press Backspace to edit.`)}`);
+      } else {
+        const win = Math.min(windowSize, filtered.length);
+        let start = Math.max(0, index - Math.floor(win / 2));
+        if (start + win > filtered.length) start = Math.max(0, filtered.length - win);
+        const slice = filtered.slice(start, start + win);
+        let sawPopularHeader = false;
+        let sawRestHeader = false;
+
+        slice.forEach((m, offset) => {
+          const absIdx = start + offset;
+          if (!query && m.isPopular && !sawPopularHeader) {
+            lines.push(`  ${yellow(bold("★ Popular"))}`);
+            sawPopularHeader = true;
+          } else if (!query && !m.isPopular && !sawRestHeader) {
+            lines.push(`  ${dim("── All models ──")}`);
+            sawRestHeader = true;
+          }
+          lines.push(formatPickerRow(m, absIdx === index));
+        });
+
+        if (filtered.length > win) {
+          lines.push(
+            `  ${dim(`showing ${start + 1}–${start + slice.length} of ${filtered.length}`)}`,
+          );
+        }
+      }
+
+      output.write(lines.join("\n") + "\n");
+      renderedLines = lines.length;
+    };
+
+    const cleanup = (selectedId) => {
+      input.off("keypress", onKeypress);
+      if (renderedLines > 0) {
+        output.write(`\x1b[${renderedLines}A\r\x1b[J`);
+      }
+      output.write("\x1b[?25h");
+      try {
+        input.setRawMode(prevRaw);
+      } catch {}
+      input.pause();
+      resolve(selectedId);
+    };
+
+    const onKeypress = (str, key = {}) => {
+      if (key.ctrl && key.name === "c") {
+        cleanup(null);
+        return;
+      }
+      if (key.name === "escape") {
+        cleanup(null);
+        return;
+      }
+      const filtered = filterModelsByQuery(ordered, query);
+      if (key.name === "return" || key.name === "enter") {
+        const chosen = filtered[index];
+        if (chosen) cleanup(chosen.id);
+        return;
+      }
+      if (key.name === "up" || (key.ctrl && key.name === "p")) {
+        if (filtered.length) index = (index - 1 + filtered.length) % filtered.length;
+        render();
+        return;
+      }
+      if (key.name === "down" || (key.ctrl && key.name === "n") || key.name === "tab") {
+        if (filtered.length) index = (index + 1) % filtered.length;
+        render();
+        return;
+      }
+      if (key.name === "pageup") {
+        if (filtered.length) index = Math.max(0, index - 8);
+        render();
+        return;
+      }
+      if (key.name === "pagedown") {
+        if (filtered.length) index = Math.min(filtered.length - 1, index + 8);
+        render();
+        return;
+      }
+      if (key.name === "backspace") {
+        if (query.length) {
+          query = query.slice(0, -1);
+          index = 0;
+          render();
+        }
+        return;
+      }
+      if (key.ctrl && key.name === "u") {
+        if (query.length) {
+          query = "";
+          index = 0;
+          render();
+        }
+        return;
+      }
+      if (str && !key.ctrl && !key.meta && str.length === 1 && str.charCodeAt(0) >= 0x20) {
+        query += str;
+        index = 0;
+        render();
+      }
+    };
+
+    input.on("keypress", onKeypress);
+    render();
+  });
+}
+
 export async function main(
   argv = process.argv.slice(2),
-  { fetcher, input = process.stdin, output = process.stdout, interactive } = {},
+  {
+    fetcher,
+    input = process.stdin,
+    output = process.stdout,
+    interactive,
+    openBrowser,
+  } = {},
 ) {
   const interactiveTty = isInteractiveTerminal({ input, output, interactive });
   const args = parseArgs(argv);
@@ -460,14 +918,33 @@ export async function main(
       return 1;
     }
     if (args.command === "pause") {
-      const paused = pauseAgent(target);
-      console.log(
-        `${green("✓")} Paused HallPass default routing${target === "all" ? "" : ` for ${bold(cleanLog(target))}`} (keys & credits preserved).`,
-      );
-      for (const item of paused) {
-        console.log(`  ${dim("restored native default")} ${cleanLog(item.agent)}`);
+      if (target !== "all" && !creds.keys?.[target]) {
+        console.error(
+          red(`${cleanLog(target)} is not configured yet. Run \`npx hallpassai auth\` first.`),
+        );
+        return 1;
       }
-      console.log(dim("  Re-enable anytime with `npx hallpassai resume` or run once with `npx hallpassai run`."));
+      const paused = pauseAgent(target);
+      if (!paused.length) {
+        console.error(red("No matching HallPass tools to pause."));
+        return 1;
+      }
+      const autoPaused = paused.filter((p) => !p.manual);
+      if (autoPaused.length) {
+        console.log(
+          `${green("✓")} Paused HallPass default routing${target === "all" ? "" : ` for ${bold(cleanLog(target))}`} (keys & credits preserved).`,
+        );
+      }
+      for (const item of paused) {
+        if (item.manual) {
+          console.log(`  ${yellow("note")} ${cleanLog(item.agent)}: ${cleanLog(item.note)}`);
+        } else {
+          console.log(`  ${dim("restored native default")} ${cleanLog(item.agent)}`);
+        }
+      }
+      if (autoPaused.length) {
+        console.log(dim("  Re-enable anytime with `npx hallpassai resume` or run once with `npx hallpassai run`."));
+      }
       if (!telemetryDisabled()) {
         await sendCliEvent(
           "cli_paused",
@@ -487,11 +964,21 @@ export async function main(
       }
       return 0;
     }
+    if (target !== "all" && !creds.keys?.[target]) {
+      console.error(
+        red(`${cleanLog(target)} is not configured yet. Run \`npx hallpassai auth\` first.`),
+      );
+      return 1;
+    }
     const catalogModels = await fetchCatalogDetails(
       { apiBase: first.apiBase, origin: args.origin },
       fetcher ? { fetcher } : undefined,
     );
     const resumed = resumeAgent(target, { catalogModels });
+    if (!resumed.length) {
+      console.error(red("No matching HallPass tools to resume."));
+      return 1;
+    }
     for (const item of resumed) {
       console.log(
         `${green("✓")} Resumed ${bold(cleanLog(item.agent))} → ${bold(cleanLog(item.model))}`,
@@ -616,15 +1103,20 @@ export async function main(
     }
 
     const first = entries[0][1];
-    const ledger = await fetchCliUsage(
-      {
-        origin: args.origin,
-        apiBase: first?.apiBase,
-        token: first?.token,
-        limit: 15,
-      },
-      fetcher ? { fetcher } : undefined,
-    );
+    let ledger = null;
+    for (const [, entry] of entries) {
+      if (!entry?.token || !entry?.apiBase) continue;
+      ledger = await fetchCliUsage(
+        {
+          origin: args.origin,
+          apiBase: entry.apiBase,
+          token: entry.token,
+          limit: 15,
+        },
+        fetcher ? { fetcher } : undefined,
+      );
+      if (ledger) break;
+    }
 
     if (args.command === "usage") {
       if (!ledger) {
@@ -787,7 +1279,7 @@ export async function main(
     return allHealthy ? 0 : 1;
   }
 
-  const isModelCompatibleWithAgent = (agent, modelObj, catalogList = []) => {
+  const isModelCompatibleWithAgent = (agent, modelObj) => {
     if (!modelObj) return true;
     const reqProto =
       agent === "claude-code"
@@ -802,32 +1294,11 @@ export async function main(
     ) {
       return false;
     }
-    if (agent === "codex") {
-      const hasNativeOpenAi = catalogList.some(
-        (m) =>
-          m.protocols?.includes("responses") &&
-          (m.provider === "OpenAI" ||
-            /^(?:gpt-|openai-gpt-|o[134]|codex)/i.test(m.id)),
-      );
-      if (
-        hasNativeOpenAi &&
-        modelObj.provider !== "OpenAI" &&
-        !/^(?:gpt-|openai-gpt-|o[134]|codex)/i.test(modelObj.id)
-      ) {
-        return false;
-      }
-    }
     return true;
   };
 
   if (args.command === "add") {
     if (!validateAgentFlag()) return 1;
-    if (!args.modelArg || !isValidModelId(args.modelArg)) {
-      console.error(
-        red("Provide a model ID to add (e.g. `npx hallpassai add gpt-6.1-sol`)."),
-      );
-      return 1;
-    }
     const creds = readStoredCredentials();
     const targets =
       args.agent && args.agent !== "all"
@@ -836,39 +1307,97 @@ export async function main(
     if (!targets.length) {
       console.error(
         red(
-          "No HallPass tools configured yet. Pair first at https://app.hallpassai.com/start.html#connect",
+          "No HallPass tools configured yet. Run `npx hallpassai auth` first.",
         ),
       );
       return 1;
     }
     const first = creds.keys[targets[0]];
+    if (!first) {
+      console.error(
+        red(
+          `${cleanLog(targets[0])} is not configured yet. Run \`npx hallpassai auth\` first.`,
+        ),
+      );
+      return 1;
+    }
     const catalogModels = await fetchCatalogDetails(
       { apiBase: first?.apiBase, origin: args.origin },
       fetcher ? { fetcher } : undefined,
     );
+
+    let chosenModelId = args.modelArg;
+    if (!chosenModelId) {
+      if (!interactiveTty) {
+        console.error(
+          red("Provide a model ID to add (e.g. `npx hallpassai add deepseek-v4.1-flash`), or run interactively to pick one."),
+        );
+        return 1;
+      }
+      let pool = catalogModels;
+      if (!pool.length && first?.token && first?.apiBase) {
+        const live = await fetchLiveModels(
+          { apiBase: first.apiBase, token: first.token },
+          fetcher ? { fetcher } : undefined,
+        );
+        if (live.ok) {
+          pool = live.models.map((id) => ({
+            id,
+            name: id,
+            provider: "HallPass",
+            protocols: ["messages", "responses", "chat/completions"],
+          }));
+        }
+      }
+      const compatiblePool = pool.filter((m) =>
+        targets.some((agent) => isModelCompatibleWithAgent(agent, m)),
+      );
+      if (!compatiblePool.length) {
+        console.error(red("Could not load compatible HallPass models."));
+        return 1;
+      }
+      const picked = await pickModelInteractive(compatiblePool, {
+        title: `Add a model to ${targets.join(", ")}`,
+        input,
+        output,
+      });
+      if (!picked) {
+        console.log(dim("Cancelled."));
+        return 0;
+      }
+      chosenModelId = picked;
+    }
+
+    if (!isValidModelId(chosenModelId)) {
+      console.error(
+        red("Provide a valid model ID to add (e.g. `npx hallpassai add deepseek-v4.1-flash`)."),
+      );
+      return 1;
+    }
+
     const catalogMatch = catalogModels.length
-      ? catalogModels.find((m) => m.id === args.modelArg)
+      ? catalogModels.find((m) => m.id === chosenModelId)
       : null;
     if (catalogModels.length && !catalogMatch) {
       console.error(
         red(
-          `Unknown model "${cleanLog(args.modelArg)}". Run \`npx hallpassai models\` to browse available models.`,
+          `Unknown model "${cleanLog(chosenModelId)}". Run \`npx hallpassai add\` to browse interactively or \`npx hallpassai models\`.`,
         ),
       );
       return 1;
     }
     const addedTo = [];
     for (const agent of targets) {
-      if (catalogMatch && !isModelCompatibleWithAgent(agent, catalogMatch, catalogModels)) {
+      if (catalogMatch && !isModelCompatibleWithAgent(agent, catalogMatch)) {
         if (targets.length === 1) {
           console.error(
-            red(`Model "${cleanLog(args.modelArg)}" is not supported by ${cleanLog(agent)}.`),
+            red(`Model "${cleanLog(chosenModelId)}" is not supported by ${cleanLog(agent)}.`),
           );
           return 1;
         }
         continue;
       }
-      const res = addModelToAgent(agent, args.modelArg, { catalogModels });
+      const res = addModelToAgent(agent, chosenModelId, { catalogModels });
       addedTo.push(agent);
       console.log(
         `${green("✓")} Added ${bold(cleanLog(res.model))} to ${bold(cleanLog(agent))}`,
@@ -878,7 +1407,7 @@ export async function main(
     }
     if (!addedTo.length) {
       console.error(
-        red(`No configured tool on this machine supports "${cleanLog(args.modelArg)}".`),
+        red(`No configured tool on this machine supports "${cleanLog(chosenModelId)}".`),
       );
       return 1;
     }
@@ -892,7 +1421,7 @@ export async function main(
           meta: buildCliMeta({
             cliVersion: pkg.version,
             anonymousId: getAnonymousId(),
-            modelId: args.modelArg,
+            modelId: chosenModelId,
             configuredHarnesses: addedTo,
           }),
         },
@@ -905,6 +1434,20 @@ export async function main(
   if (args.command === "run") {
     if (!validateAgentFlag()) return 1;
     const creds = readStoredCredentials();
+    if (args.agent === "cursor") {
+      const cEntry = creds.keys?.cursor;
+      console.log(
+        `${bold("Cursor")} is a desktop app and cannot be launched ephemerally from the terminal.`,
+      );
+      if (cEntry) {
+        console.log(`  Base URL: ${cleanLog(cEntry.apiBase)}`);
+        console.log(`  Model:    ${cleanLog(cEntry.model)}`);
+      }
+      console.log(
+        dim("  Configure it under Cursor → Settings → Models → Override OpenAI Base URL."),
+      );
+      return 0;
+    }
     const configuredAgents = Object.keys(creds.keys || {}).filter(
       (k) => k !== "cursor",
     );
@@ -980,7 +1523,7 @@ export async function main(
     const detailed = await fetchCatalogDetails(
       {
         apiBase: first?.apiBase || null,
-        origin: args.origin || (!first?.apiBase ? resolveOrigin("HP") : null),
+        origin: args.origin || (!first?.apiBase ? resolveOrigin(null) : null),
       },
       fetcher ? { fetcher } : undefined,
     );
@@ -1070,6 +1613,14 @@ export async function main(
     }
 
     const first = creds.keys[targets[0]];
+    if (!first) {
+      console.error(
+        red(
+          `${cleanLog(targets[0])} is not configured yet. Run \`npx hallpassai auth\` first.`,
+        ),
+      );
+      return 1;
+    }
     const catalogModels = await fetchCatalogDetails(
       { apiBase: first?.apiBase, origin: args.origin },
       fetcher ? { fetcher } : undefined,
@@ -1179,11 +1730,7 @@ export async function main(
       return 1;
     }
 
-    const inferOfflineCompatible = (agent, modelId) => {
-      if (agent === "codex")
-        return /^(?:gpt-|openai-gpt-|o[134]\b|o[134]-|codex)/i.test(modelId);
-      return true;
-    };
+    const inferOfflineCompatible = () => true;
 
     const updatedAgents = [];
     for (const agent of targets) {
@@ -1267,14 +1814,35 @@ export async function main(
     return 0;
   }
 
+  if (!validateAgentFlag()) return 1;
+
+  if (args.command === "auth" && !args.code && !args.dryRun) {
+    if (!interactiveTty) {
+      console.error(
+        red(
+          "Non-interactive shell: pass a pairing code (npx hallpassai auth <CODE>).",
+        ),
+      );
+      return 1;
+    }
+    const authOrigin = resolveOrigin(null, args.origin);
+    args.code = await runBrowserAuthFlow({
+      origin: authOrigin,
+      agent: args.agent,
+      noBrowser: args.noBrowser,
+      input,
+      output,
+      openBrowser: openBrowser || openSystemBrowser,
+    });
+  }
+
   const parsedCode = args.code ? normalizeCode(args.code) : null;
   if (!parsedCode) {
     console.error(
-      red("Please provide a valid pairing code (e.g. `npx hallpassai HP-XXXX-XXXX`)."),
+      red("Run `npx hallpassai auth` to sign in, or pass a pairing code (`npx hallpassai auth HP-XXXX-XXXX`)."),
     );
     return 1;
   }
-  if (!validateAgentFlag()) return 1;
 
   if (args.dryRun) {
     const resolvedOrigin = resolveOrigin(parsedCode.prefix, args.origin);
@@ -1343,27 +1911,51 @@ export async function main(
   const configuredResults = [];
 
   try {
-    for (const agent of agents) {
-      let chosenMode = args.mode || "default";
-      if (!args.mode && interactiveTty && agent !== "cursor") {
-        const sub = detectExistingSubscription(agent);
-        if (sub.detected) {
-          const rl = readline.createInterface({ input, output });
-          try {
-            console.log(`\n${bold(`Existing ${sub.label} detected:`)}`);
-            console.log(
-              `  ${bold("[1]")} Keep my existing login & add HallPass alongside ${green("(Recommended)")}`,
-            );
-            console.log(
-              `  ${bold("[2]")} Use HallPass as default for ${cleanLog(agent)} ${dim("(pause anytime with `npx hallpassai pause`)")}`,
-            );
-            const ans = (await rl.question("Choose [1/2] (default 1): ")).trim();
-            chosenMode = ans === "2" ? "default" : "coexist";
-          } finally {
-            rl.close();
-          }
+    const existingLogins = agents
+      .filter((a) => a !== "cursor")
+      .map((a) => ({ agent: a, ...detectExistingSubscription(a) }))
+      .filter((x) => x.detected);
+
+    let promptedMode = null;
+    if (!args.mode && existingLogins.length > 0) {
+      if (interactiveTty) {
+        const names = existingLogins.map((x) => x.label).join(" & ");
+        const rl = readline.createInterface({ input, output });
+        try {
+          console.log(`\n${bold(`Found existing ${names}.`)}`);
+          console.log(dim("No files have been changed yet. How should HallPass connect?\n"));
+          console.log(
+            `  ${bold("[1]")} Keep existing logins untouched ${green("(Recommended)")}`,
+          );
+          console.log(
+            dim("      Plain claude / codex stay on your current subscriptions."),
+          );
+          console.log(
+            dim("      Launch HallPass via claude-hp, codex -p hallpass, or OpenCode /models.\n"),
+          );
+          console.log(
+            `  ${bold("[2]")} Make HallPass the default`,
+          );
+          console.log(
+            dim("      Updates your tool config (backs up originals; preserves hooks & MCPs)."),
+          );
+          console.log(
+            dim("      Switch back anytime with `npx hallpassai pause` or `npx hallpassai uninstall`.\n"),
+          );
+          const ans = (await rl.question("Choice [1/2] (default 1): ")).trim();
+          promptedMode = ans === "2" ? "default" : "coexist";
+        } finally {
+          rl.close();
         }
+      } else {
+        // Non-interactive safety: never silently overwrite an existing paid subscription login.
+        promptedMode = "coexist";
       }
+    }
+
+    for (const agent of agents) {
+      const hasSub = existingLogins.some((x) => x.agent === agent);
+      const chosenMode = args.mode || (hasSub && promptedMode ? promptedMode : "default");
 
       const perAgentToken = claimed.tokensByHarness?.[agent] || claimed.token;
       const res = configureAgent(

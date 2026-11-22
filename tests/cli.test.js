@@ -18,6 +18,7 @@ import {
   detectExistingSubscription,
   switchAgentModel,
   upsertCodexToml,
+  stripJsonc,
   normalizeCode,
   resolveOrigin,
   originFromApiBase,
@@ -29,7 +30,14 @@ import {
   upsertShellBlock,
   helperScriptPath,
 } from "../src/index.js";
-import { main as cliMain, parseArgs, normalizeAgentName } from "../bin/cli.js";
+import {
+  main as cliMain,
+  parseArgs,
+  normalizeAgentName,
+  orderModelsWithPopularFirst,
+  filterModelsByQuery,
+  pickModelInteractive,
+} from "../bin/cli.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -831,7 +839,7 @@ test("coexist mode keeps existing logins & dotfiles untouched across claude-code
       path.join(home, ".config", "fish", "config.fish"),
       "utf8",
     );
-    assert.match(fishCfg, /test -f '.*copilot\.env'; and source '.*copilot\.env'/);
+    assert.match(fishCfg, /test -f '.*copilot\.fish'; and source '.*copilot\.fish'/);
     undoAgent("copilot", { homeDir: home, shell: "/opt/homebrew/bin/fish" });
     assert.equal(
       fs.existsSync(path.join(home, ".config", "fish", "config.fish")),
@@ -1042,3 +1050,286 @@ test("interactive subscription guard, per-harness all-mode partial uninstall, ag
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+
+test("auth browser OAuth callback verifies state, rejects bad state, claims code, and supports non-OpenAI Codex add", async () => {
+  assert.equal(parseArgs(["auth"]).command, "auth");
+  assert.equal(parseArgs(["login"]).command, "auth");
+  assert.equal(parseArgs(["auth", "HPL-ABCD-2345"]).code, "HPL-ABCD-2345");
+  assert.equal(parseArgs(["auth", "--no-browser"]).noBrowser, true);
+  assert.equal(parseArgs(["add", "deepseek-v4.1-flash", "--harness", "codex"]).agent, "codex");
+  assert.equal(parseArgs(["add", "deepseek-v4.1-flash", "--harness=claude"]).agent, "claude-code");
+
+  // Non-interactive auth without code fails fast instead of hanging
+  const failFast = await cliMain(["auth"], { interactive: false });
+  assert.equal(failFast, 1);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hp-oauth-cli-"));
+  const prevCfg = process.env.HALLPASS_CONFIG_DIR;
+  const prevDisableKc = process.env.HALLPASS_DISABLE_KEYCHAIN;
+  const prevHome = process.env.HOME;
+  process.env.HALLPASS_CONFIG_DIR = path.join(dir, ".config", "hallpass");
+  process.env.HALLPASS_DISABLE_KEYCHAIN = "1";
+  process.env.HOME = dir;
+
+  const catalogWithDeepSeek = [
+    ...SAMPLE_PAYLOAD.models,
+    {
+      id: "deepseek-v4.1-flash",
+      name: "DeepSeek V4.1 Flash",
+      provider: "DeepSeek",
+      protocols: ["messages", "responses", "chat/completions"],
+    },
+  ];
+  const tok = "hp_live_" + "o".repeat(43);
+
+  const server = http.createServer(async (req, res) => {
+    for await (const _c of req) { /* drain */ }
+    res.setHeader("Content-Type", "application/json");
+    if (req.url === "/api/core/pair/claim") {
+      res.end(
+        JSON.stringify({
+          operationId: "op_browser_auth",
+          harness: "codex",
+          model: "gpt-5.4",
+          token: tok,
+          progressToken: "hp_pair_" + "o".repeat(43),
+          apiBase: `http://127.0.0.1:${server.address().port}/v1`,
+          models: catalogWithDeepSeek,
+        }),
+      );
+    } else if (req.url === "/api/core/catalog") {
+      res.end(JSON.stringify({ models: catalogWithDeepSeek }));
+    } else if (req.url === "/v1/models") {
+      res.end(JSON.stringify({ object: "list", data: catalogWithDeepSeek.map((m) => ({ id: m.id })) }));
+    } else if (req.url === "/api/core/pair/status" || req.url === "/api/core/cli/event") {
+      res.end(JSON.stringify({ ok: true }));
+    } else {
+      res.statusCode = 404;
+      res.end("{}");
+    }
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+
+  try {
+    const base = `http://127.0.0.1:${server.address().port}`;
+    let openedUrl = null;
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const exit = await cliMain(
+      ["auth", "--agent", "codex", "--no-launch", "--origin", base],
+      {
+        interactive: true,
+        input,
+        output,
+        openBrowser: (urlStr) => {
+          openedUrl = new URL(urlStr);
+          const port = openedUrl.searchParams.get("cli_port");
+          const state = openedUrl.searchParams.get("cli_state");
+          // First attempt with wrong state must be rejected with 400
+          void fetch(`http://127.0.0.1:${port}/callback?code=HPL-ABCD-2345&state=wrong_state`)
+            .then((r) => {
+              assert.equal(r.status, 400);
+              return fetch(`http://127.0.0.1:${port}/callback?code=HPL-ABCD-2345&state=${encodeURIComponent(state)}`);
+            })
+            .then((r) => {
+              assert.equal(r.status, 200);
+            });
+          return true;
+        },
+      },
+    );
+    assert.equal(exit, 0);
+    assert.ok(openedUrl, "auth must invoke browser launch with cli_port and cli_state");
+    assert.equal(openedUrl.searchParams.get("cli_agent"), "codex");
+
+    // Adding a non-OpenAI /v1/responses model (deepseek-v4.1-flash) to Codex now succeeds!
+    const addExit = await cliMain(["add", "deepseek-v4.1-flash", "--agent", "codex", "--origin", base]);
+    assert.equal(addExit, 0);
+    const codexToml = fs.readFileSync(path.join(dir, ".codex", "config.toml"), "utf8");
+    assert.match(codexToml, /model = "deepseek-v4\.1-flash"/);
+  } finally {
+    process.env.HOME = prevHome;
+    if (prevCfg === undefined) delete process.env.HALLPASS_CONFIG_DIR;
+    else process.env.HALLPASS_CONFIG_DIR = prevCfg;
+    if (prevDisableKc === undefined) delete process.env.HALLPASS_DISABLE_KEYCHAIN;
+    else process.env.HALLPASS_DISABLE_KEYCHAIN = prevDisableKc;
+    await new Promise((r) => server.close(r));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+
+test("add without model opens filterable picker with top 5 popular models first, supports arrow cycling + typing + Esc", async () => {
+  const catalog = [
+    { id: "zeta-model", name: "Zeta 1", provider: "Zeta", protocols: ["messages", "responses", "chat/completions"] },
+    { id: "kimi-k3.1-pro", name: "Kimi K3.1 Pro", provider: "Moonshot AI", protocols: ["messages", "responses", "chat/completions"] },
+    { id: "gpt-6.1-sol", name: "GPT-6.1 Sol", provider: "OpenAI", protocols: ["messages", "responses", "chat/completions"] },
+    { id: "claude-opus-5.5", name: "Claude Opus 5.5", provider: "Anthropic", protocols: ["messages", "chat/completions"] },
+    { id: "alpha-fast", name: "Alpha Fast", provider: "Alpha", protocols: ["messages", "responses", "chat/completions"] },
+    { id: "deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash", provider: "DeepSeek", protocols: ["messages", "responses", "chat/completions"] },
+    { id: "claude-sonnet-5.5", name: "Claude Sonnet 5.5", provider: "Anthropic", protocols: ["messages", "responses", "chat/completions"] },
+    { id: "gemini-4-carbon", name: "Gemini 4 Carbon", provider: "Google", protocols: ["messages", "chat/completions"] },
+  ];
+
+  // 1. Popular ordering puts top 5 popular models at top
+  const ordered = orderModelsWithPopularFirst(catalog, 5);
+  assert.deepEqual(
+    ordered.slice(0, 5).map((m) => m.id),
+    ["deepseek-v4.1-flash", "claude-opus-5.5", "claude-sonnet-5.5", "gpt-6.1-sol", "gemini-4-carbon"],
+  );
+  assert.equal(ordered[0].isPopular, true);
+  assert.equal(ordered[4].isPopular, true);
+  assert.equal(ordered[5].isPopular, false);
+
+  // 2. Type-to-filter matches across id, name, and provider
+  assert.deepEqual(
+    filterModelsByQuery(ordered, "moonshot").map((m) => m.id),
+    ["kimi-k3.1-pro"],
+  );
+  assert.deepEqual(
+    filterModelsByQuery(ordered, "claude").map((m) => m.id),
+    ["claude-opus-5.5", "claude-sonnet-5.5"],
+  );
+
+  // 3. Raw TTY mode: cycle down twice (index 0 -> 1 -> 2 = claude-sonnet-5.5), press Enter
+  const rawIn = new PassThrough();
+  const rawOut = new PassThrough();
+  let rawModeState = false;
+  rawIn.isTTY = true;
+  rawOut.isTTY = true;
+  rawIn.setRawMode = (v) => { rawModeState = Boolean(v); };
+  const pickPromise = pickModelInteractive(catalog, { input: rawIn, output: rawOut });
+  rawIn.write("\x1b[B"); // Down -> index 1 (claude-opus-5.5)
+  rawIn.write("\x1b[B"); // Down -> index 2 (claude-sonnet-5.5)
+  rawIn.write("\r"); // Enter
+  assert.equal(await pickPromise, "claude-sonnet-5.5");
+  assert.equal(rawModeState, false, "raw mode must be restored after pick");
+
+  // 4. Raw TTY mode: type to filter ("kimi"), then Enter
+  const rawIn2 = new PassThrough();
+  const rawOut2 = new PassThrough();
+  rawIn2.isTTY = true;
+  rawOut2.isTTY = true;
+  rawIn2.setRawMode = () => {};
+  const pickPromise2 = pickModelInteractive(catalog, { input: rawIn2, output: rawOut2 });
+  rawIn2.write("kimi");
+  rawIn2.write("\r");
+  assert.equal(await pickPromise2, "kimi-k3.1-pro");
+
+  // 5. Raw TTY mode: Esc cancels cleanly
+  const rawIn3 = new PassThrough();
+  const rawOut3 = new PassThrough();
+  rawIn3.isTTY = true;
+  rawOut3.isTTY = true;
+  rawIn3.setRawMode = () => {};
+  const pickPromise3 = pickModelInteractive(catalog, { input: rawIn3, output: rawOut3 });
+  rawIn3.write("\x1b");
+  assert.equal(await pickPromise3, null);
+
+  // 6. End-to-end `cliMain(["add"])` without model ID (piped interactive fallback + non-interactive fail-fast)
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hp-add-pick-"));
+  const prevCfg = process.env.HALLPASS_CONFIG_DIR;
+  const prevDisableKc = process.env.HALLPASS_DISABLE_KEYCHAIN;
+  const prevHome = process.env.HOME;
+  process.env.HALLPASS_CONFIG_DIR = path.join(dir, ".config", "hallpass");
+  process.env.HALLPASS_DISABLE_KEYCHAIN = "1";
+  process.env.HOME = dir;
+
+  const server = http.createServer((req, res) => {
+    res.setHeader("Content-Type", "application/json");
+    if (req.url === "/api/core/catalog") {
+      res.end(JSON.stringify({ models: catalog }));
+    } else if (req.url === "/api/core/cli/event") {
+      res.end(JSON.stringify({ ok: true }));
+    } else {
+      res.statusCode = 404;
+      res.end("{}");
+    }
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+
+  try {
+    const base = `http://127.0.0.1:${server.address().port}`;
+    configureAgent(
+      "codex",
+      {
+        token: "hp_live_" + "p".repeat(43),
+        apiBase: `${base}/v1`,
+        model: "gpt-6.1-sol",
+        models: catalog,
+      },
+      { homeDir: dir },
+    );
+
+    // Non-interactive without model fails fast
+    assert.equal(
+      await cliMain(["add", "--agent", "codex", "--origin", base], { interactive: false }),
+      1,
+    );
+
+    // Interactive without model: pick #1 (top popular compatible model = deepseek-v4.1-flash)
+    const pipeIn = new PassThrough();
+    const pipeOut = new PassThrough();
+    pipeIn.end("1\n");
+    const exit = await cliMain(["add", "--agent", "codex", "--origin", base], {
+      interactive: true,
+      input: pipeIn,
+      output: pipeOut,
+    });
+    assert.equal(exit, 0);
+    const toml = fs.readFileSync(path.join(dir, ".codex", "config.toml"), "utf8");
+    assert.match(toml, /model = "deepseek-v4\.1-flash"/);
+  } finally {
+    process.env.HOME = prevHome;
+    if (prevCfg === undefined) delete process.env.HALLPASS_CONFIG_DIR;
+    else process.env.HALLPASS_CONFIG_DIR = prevCfg;
+    if (prevDisableKc === undefined) delete process.env.HALLPASS_DISABLE_KEYCHAIN;
+    else process.env.HALLPASS_DISABLE_KEYCHAIN = prevDisableKc;
+    await new Promise((r) => server.close(r));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("CLI safety regressions: positional uninstall/pause agent, Codex pause->uninstall no duplicate TOML keys, coexist Claude settings untouched, stripJsonc strings", () =>
+  withTempHome((home) => {
+    // 1. parseArgs parses positional harness name for uninstall/pause/resume (never silently widens to 'all')
+    assert.equal(parseArgs(["uninstall", "codex"]).agent, "codex");
+    assert.equal(parseArgs(["pause", "claude"]).agent, "claude-code");
+    assert.equal(parseArgs(["resume", "opencode"]).agent, "opencode");
+
+    // 2. stripJsonc preserves ',}' inside string literals
+    const parsed = JSON.parse(stripJsonc('{"cmd": "echo a,}", // comment\n "ok": true,}'));
+    assert.equal(parsed.cmd, "echo a,}");
+    assert.equal(parsed.ok, true);
+
+    // 3. Coexist claude-code + uninstall MUST NOT touch user's unrelated ~/.claude/settings.json
+    const claudeSettings = path.join(home, ".claude", "settings.json");
+    fs.mkdirSync(path.dirname(claudeSettings), { recursive: true });
+    const nativeSettings = {
+      effortLevel: "high",
+      env: { ANTHROPIC_BASE_URL: "https://custom.internal", ANTHROPIC_API_KEY: "sk-ant-user" },
+    };
+    fs.writeFileSync(claudeSettings, JSON.stringify(nativeSettings, null, 2));
+    configureAgent("claude-code", SAMPLE_PAYLOAD, { homeDir: home, mode: "coexist" });
+    pauseAgent("claude-code", { homeDir: home });
+    undoAgent("claude-code", { homeDir: home, fullCleanup: true });
+    assert.deepEqual(JSON.parse(fs.readFileSync(claudeSettings, "utf8")), nativeSettings);
+
+    // 4. Codex pause -> pause -> uninstall never duplicates top-level model/provider TOML keys
+    const codexToml = path.join(home, ".codex", "config.toml");
+    fs.mkdirSync(path.dirname(codexToml), { recursive: true });
+    fs.writeFileSync(codexToml, 'model = "o3"\n\n[mcp_servers.local]\ncommand = "node"\n');
+    configureAgent("codex", SAMPLE_PAYLOAD, { homeDir: home, mode: "default" });
+    pauseAgent("codex", { homeDir: home });
+    pauseAgent("codex", { homeDir: home });
+    undoAgent("codex", { homeDir: home, fullCleanup: true });
+    const finalToml = fs.readFileSync(codexToml, "utf8");
+    assert.equal((finalToml.match(/^model = "o3"/gm) || []).length, 1);
+
+    // 5. Cursor pause returns honest manual note instead of marking paused
+    configureAgent("cursor", SAMPLE_PAYLOAD, { homeDir: home });
+    const cursorPause = pauseAgent("cursor", { homeDir: home });
+    assert.equal(cursorPause[0].manual, true);
+    assert.equal(inspectAgentConfig("cursor", { homeDir: home }).paused, undefined);
+  }));
