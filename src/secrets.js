@@ -181,7 +181,7 @@ export function readStoredCredentials(homeDir = os.homedir()) {
 
 export function storeCredential(
   harness,
-  { token, apiBase, model, reasoning = null },
+  { token, apiBase, model, reasoning = null, mode = "default", paused = false },
   { homeDir = os.homedir(), useKeychain = process.platform === "darwin" } = {},
 ) {
   if (!/^[a-z0-9-]+$/.test(harness)) {
@@ -213,6 +213,8 @@ export function storeCredential(
     keychain: storedInKeychain,
     apiBase,
     model,
+    mode: mode === "coexist" ? "coexist" : "default",
+    ...(paused ? { paused: true } : {}),
     ...(reasoning && reasoning !== "auto" ? { reasoning } : {}),
     updatedAt: new Date().toISOString(),
   };
@@ -269,6 +271,8 @@ export function purgeHallpassDir(
   const dir = hallpassDir(homeDir);
   for (const fileName of [
     "copilot.env",
+    "claude-settings.json",
+    "previous-state.json",
     "read-key.mjs",
     "credentials.json",
     "telemetry.json",
@@ -279,6 +283,21 @@ export function purgeHallpassDir(
       fs.unlinkSync(fp);
       removed.push(fp);
     }
+  }
+  const shimsDir = path.join(dir, "bin");
+  if (fs.existsSync(shimsDir)) {
+    assertNotSymlink(shimsDir);
+    for (const shimName of ["claude-hp", "codex-hp", "copilot-hp"]) {
+      const sp = path.join(shimsDir, shimName);
+      if (fs.existsSync(sp)) {
+        assertNotSymlink(sp);
+        fs.unlinkSync(sp);
+        removed.push(sp);
+      }
+    }
+    try {
+      if (fs.readdirSync(shimsDir).length === 0) fs.rmdirSync(shimsDir);
+    } catch {}
   }
   try {
     if (fs.existsSync(dir) && fs.readdirSync(dir).length === 0) {

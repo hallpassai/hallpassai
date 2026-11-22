@@ -181,17 +181,43 @@ export function validateClaimPayload(body, resolvedOrigin) {
           ...(Number.isInteger(m.contextLength) && m.contextLength > 0
             ? { contextLength: m.contextLength }
             : {}),
+          ...(typeof m.inputPerMillion === "number" && Number.isFinite(m.inputPerMillion) && m.inputPerMillion >= 0
+            ? { inputPerMillion: m.inputPerMillion }
+            : {}),
+          ...(typeof m.outputPerMillion === "number" && Number.isFinite(m.outputPerMillion) && m.outputPerMillion >= 0
+            ? { outputPerMillion: m.outputPerMillion }
+            : {}),
+          ...(typeof m.cacheReadPerMillion === "number" && Number.isFinite(m.cacheReadPerMillion) && m.cacheReadPerMillion >= 0
+            ? { cacheReadPerMillion: m.cacheReadPerMillion }
+            : {}),
+          ...(typeof m.cacheWritePerMillion === "number" && Number.isFinite(m.cacheWritePerMillion) && m.cacheWritePerMillion >= 0
+            ? { cacheWritePerMillion: m.cacheWritePerMillion }
+            : {}),
           ...(m.reasoning === true || Boolean(m.reasoning?.supported)
             ? { reasoning: true }
             : {}),
         }))
     : [];
+  const tokensByHarness = {};
+  if (body.tokensByHarness && typeof body.tokensByHarness === "object" && !Array.isArray(body.tokensByHarness)) {
+    for (const [hKey, hTok] of Object.entries(body.tokensByHarness)) {
+      if (
+        VALID_HARNESSES.has(hKey) &&
+        hKey !== "all" &&
+        typeof hTok === "string" &&
+        /^[A-Za-z0-9_.-]{16,256}$/.test(hTok)
+      ) {
+        tokensByHarness[hKey] = hTok;
+      }
+    }
+  }
   return {
     operationId:
       typeof body.operationId === "string" ? body.operationId : undefined,
     harness: body.harness,
     model: body.model,
     token: body.token,
+    ...(Object.keys(tokensByHarness).length ? { tokensByHarness } : {}),
     progressToken,
     apiBase,
     models,
@@ -248,7 +274,7 @@ export function buildCliMeta({
 
 export async function claimCode(
   code,
-  { origin, meta = null, fetcher = fetch } = {},
+  { origin, meta = null, harnesses = null, fetcher = fetch } = {},
 ) {
   const parsed = normalizeCode(code);
   if (!parsed) {
@@ -265,7 +291,11 @@ export async function claimCode(
   const res = await fetcher(`${baseOrigin}/api/core/pair/claim`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "User-Agent": ua },
-    body: JSON.stringify({ code: parsed.code, ...(meta ? { meta } : {}) }),
+    body: JSON.stringify({
+      code: parsed.code,
+      ...(meta ? { meta } : {}),
+      ...(Array.isArray(harnesses) && harnesses.length ? { harnesses } : {}),
+    }),
     signal: AbortSignal.timeout(15000),
     redirect: "error",
   });
@@ -364,6 +394,18 @@ export async function fetchCatalogDetails(
               Number.isInteger(m.contextLength) && m.contextLength > 0
                 ? m.contextLength
                 : undefined,
+            ...(typeof m.inputPerMillion === "number" && Number.isFinite(m.inputPerMillion) && m.inputPerMillion >= 0
+              ? { inputPerMillion: m.inputPerMillion }
+              : {}),
+            ...(typeof m.outputPerMillion === "number" && Number.isFinite(m.outputPerMillion) && m.outputPerMillion >= 0
+              ? { outputPerMillion: m.outputPerMillion }
+              : {}),
+            ...(typeof m.cacheReadPerMillion === "number" && Number.isFinite(m.cacheReadPerMillion) && m.cacheReadPerMillion >= 0
+              ? { cacheReadPerMillion: m.cacheReadPerMillion }
+              : {}),
+            ...(typeof m.cacheWritePerMillion === "number" && Number.isFinite(m.cacheWritePerMillion) && m.cacheWritePerMillion >= 0
+              ? { cacheWritePerMillion: m.cacheWritePerMillion }
+              : {}),
             reasoning: Boolean(m.reasoning?.supported),
           }))
       : [];
@@ -456,4 +498,28 @@ export async function sendCliEvent(
       redirect: "error",
     });
   } catch {}
+}
+
+export async function fetchCliUsage(
+  { origin, apiBase, token, limit = 20 } = {},
+  { fetcher = fetch } = {},
+) {
+  if (typeof token !== "string" || !/^hp_live_[A-Za-z0-9_-]{43}$/.test(token)) {
+    return null;
+  }
+  try {
+    const safeOrigin = originFromApiBase(apiBase, origin);
+    const n = Math.max(1, Math.min(50, Number(limit) || 20));
+    const res = await fetcher(`${safeOrigin}/api/core/cli/usage?limit=${n}`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(8000),
+      redirect: "error",
+    });
+    if (!res.ok) return null;
+    const body = await res.json().catch(() => null);
+    return body?.ok ? body : null;
+  } catch {
+    return null;
+  }
 }

@@ -6,10 +6,16 @@ import os from "node:os";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
 import { spawnSync, execFile } from "node:child_process";
+import { PassThrough } from "node:stream";
 import { promisify } from "node:util";
 import {
   configureAgent,
+  addModelToAgent,
+  pauseAgent,
+  resumeAgent,
   undoAgent,
+  inspectAgentConfig,
+  detectExistingSubscription,
   switchAgentModel,
   upsertCodexToml,
   normalizeCode,
@@ -23,7 +29,7 @@ import {
   upsertShellBlock,
   helperScriptPath,
 } from "../src/index.js";
-import { main as cliMain, parseArgs } from "../bin/cli.js";
+import { main as cliMain, parseArgs, normalizeAgentName } from "../bin/cli.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -53,11 +59,18 @@ const SAMPLE_PAYLOAD = {
       id: "claude-sonnet-4-6",
       name: "Claude Sonnet 4.6",
       protocols: ["messages", "chat/completions"],
+      inputPerMillion: 3,
+      outputPerMillion: 15,
+      cacheReadPerMillion: 0.3,
+      cacheWritePerMillion: 3.75,
     },
     {
       id: "gpt-5.4",
       name: "GPT-5.4",
       protocols: ["responses", "chat/completions"],
+      inputPerMillion: 5,
+      outputPerMillion: 22.5,
+      cacheReadPerMillion: 0.5,
     },
   ],
 };
@@ -260,7 +273,13 @@ test("opencode adapter writes opencode.json provider and 0600 auth.json with typ
     assert.equal(cfg.provider.hallpass.options.baseURL, "https://api.hallpassai.com/v1");
     assert.deepEqual(cfg.provider.hallpass.models["claude-sonnet-4-6"].limit, {
       context: 128000,
-      output: 8192,
+      output: 16384,
+    });
+    assert.deepEqual(cfg.provider.hallpass.models["claude-sonnet-4-6"].cost, {
+      input: 3,
+      output: 15,
+      cache_read: 0.3,
+      cache_write: 3.75,
     });
     assert.deepEqual(cfg.provider.hallpass.models["claude-sonnet-4-6"].options, {
       reasoningEffort: "high",
@@ -421,6 +440,56 @@ test("end-to-end CLI claims pairing code over HTTP, configures tool, verifies /v
             ],
           }),
         );
+      } else if (req.url?.startsWith("/api/core/cli/usage")) {
+        res.end(
+          JSON.stringify({
+            ok: true,
+            account: {
+              restricted: false,
+              debtMicros: "0",
+              availableMicros: "5761466",
+              heldMicros: "0",
+              completedRequests: 2,
+              pendingRequests: 0,
+              totalCostMicros: "238534",
+              inputTokens: "63512",
+              cachedInputTokens: "31200",
+              cacheWriteTokens: "32100",
+              outputTokens: "1205",
+            },
+            key: {
+              id: "key_1",
+              prefix: SAMPLE_PAYLOAD.token.slice(0, 15),
+              label: "Claude Code",
+              harness: "claude-code",
+              completedRequests: 2,
+              pendingRequests: 0,
+              totalCostMicros: "238534",
+              inputTokens: "63512",
+              cachedInputTokens: "31200",
+              cacheWriteTokens: "32100",
+              outputTokens: "1205",
+            },
+            recentRequests: [
+              {
+                id: "req_1",
+                model: "claude-sonnet-4-6",
+                protocol: "messages",
+                harness: "claude-code",
+                sameKey: true,
+                status: "completed",
+                costMicros: "71299",
+                usage: {
+                  input: 32500,
+                  cachedInput: 31200,
+                  cacheWriteInput: 1250,
+                  output: 620,
+                },
+                createdAt: new Date().toISOString(),
+              },
+            ],
+          }),
+        );
       } else if (req.url === "/api/core/cli/revoke") {
         revokedAuth = req.headers.authorization;
         res.end(JSON.stringify({ ok: true, revoked: true }));
@@ -433,6 +502,9 @@ test("end-to-end CLI claims pairing code over HTTP, configures tool, verifies /v
     });
 
     assert.equal(await cliMain(["doctor", "--origin", base]), 0);
+    assert.equal(await cliMain(["status", "--origin", base]), 0);
+    assert.equal(await cliMain(["usage", "--origin", base]), 0);
+    assert.equal(await cliMain(["usage", "--json", "--origin", base]), 0);
     assert.equal(
       await cliMain(["models", "--provider", "Anthropic", "--search", "opus 5.5", "--origin", base]),
       0,
@@ -672,4 +744,301 @@ test("security & multi-harness regressions: blocks foreign --origin token exfilt
     assert.ok(!tomlCleared.includes("model_reasoning_effort"));
     assert.match(tomlCleared, /\[mcp_servers\.local\]\nmodel = "keep-inside-section"/);
   });
+});
+
+test("coexist mode keeps existing logins & dotfiles untouched across claude-code, codex, opencode, and copilot, plus fish shell RC", () =>
+  withTempHome((home) => {
+    fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+    fs.writeFileSync(
+      path.join(home, ".claude", ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "oauth_1" } }),
+    );
+    const claudeSettings = path.join(home, ".claude", "settings.json");
+    fs.writeFileSync(
+      claudeSettings,
+      JSON.stringify({ permissions: { allow: ["Read"] } }, null, 2),
+    );
+
+    fs.mkdirSync(path.join(home, ".codex"), { recursive: true });
+    fs.writeFileSync(
+      path.join(home, ".codex", "auth.json"),
+      JSON.stringify({ tokens: { access_token: "chatgpt_1" } }),
+    );
+    const codexToml = path.join(home, ".codex", "config.toml");
+    fs.writeFileSync(codexToml, 'model = "o3"\n');
+
+    const ocDir = path.join(home, ".config", "opencode");
+    fs.mkdirSync(ocDir, { recursive: true });
+    const ocJson = path.join(ocDir, "opencode.json");
+    fs.writeFileSync(
+      ocJson,
+      JSON.stringify({ model: "anthropic/claude-sonnet-4-6" }, null, 2),
+    );
+    const zshrc = path.join(home, ".zshrc");
+    fs.writeFileSync(zshrc, 'export PATH="/usr/local/bin:$PATH"\n');
+
+    assert.equal(detectExistingSubscription("claude-code", home).detected, true);
+    assert.equal(detectExistingSubscription("codex", home).detected, true);
+
+    configureAgent("claude-code", SAMPLE_PAYLOAD, { homeDir: home, mode: "coexist" });
+    configureAgent("codex", SAMPLE_PAYLOAD, { homeDir: home, mode: "coexist" });
+    configureAgent("opencode", SAMPLE_PAYLOAD, { homeDir: home, mode: "coexist" });
+    configureAgent("copilot", SAMPLE_PAYLOAD, {
+      homeDir: home,
+      shell: "/bin/zsh",
+      mode: "coexist",
+    });
+
+    // Global defaults remain untouched
+    const afterClaude = JSON.parse(fs.readFileSync(claudeSettings, "utf8"));
+    assert.equal(afterClaude.env, undefined);
+    assert.deepEqual(afterClaude.permissions, { allow: ["Read"] });
+    assert.ok(fs.existsSync(path.join(home, ".config", "hallpass", "claude-settings.json")));
+    assert.ok(fs.existsSync(path.join(home, ".config", "hallpass", "bin", "claude-hp")));
+    assert.equal(inspectAgentConfig("claude-code", { homeDir: home }).ok, true);
+
+    const afterCodex = fs.readFileSync(codexToml, "utf8");
+    assert.match(afterCodex, /^model = "o3"/m);
+    assert.doesNotMatch(afterCodex, /^model_provider = "hallpass"/m);
+    assert.match(afterCodex, /\[model_providers\.hallpass\]/);
+    assert.ok(fs.existsSync(path.join(home, ".codex", "hallpass.config.toml")));
+    assert.ok(fs.existsSync(path.join(home, ".config", "hallpass", "bin", "codex-hp")));
+    assert.equal(inspectAgentConfig("codex", { homeDir: home }).ok, true);
+
+    const afterOc = JSON.parse(fs.readFileSync(ocJson, "utf8"));
+    assert.equal(afterOc.model, "anthropic/claude-sonnet-4-6");
+    assert.ok(afterOc.provider.hallpass.models["claude-sonnet-4-6"]);
+    assert.equal(inspectAgentConfig("opencode", { homeDir: home }).ok, true);
+
+    assert.doesNotMatch(fs.readFileSync(zshrc, "utf8"), /hallpass/);
+    assert.ok(fs.existsSync(path.join(home, ".config", "hallpass", "bin", "copilot-hp")));
+    assert.equal(inspectAgentConfig("copilot", { homeDir: home, shell: "/bin/zsh" }).ok, true);
+
+    undoAgent("all", { homeDir: home, shell: "/bin/zsh", fullCleanup: true });
+    assert.equal(fs.existsSync(path.join(home, ".config", "hallpass")), false);
+    assert.equal(fs.existsSync(path.join(home, ".codex", "hallpass.config.toml")), false);
+    assert.deepEqual(JSON.parse(fs.readFileSync(claudeSettings, "utf8")), {
+      permissions: { allow: ["Read"] },
+    });
+
+    // Fish shell default mode writes valid fish syntax to ~/.config/fish/config.fish
+    configureAgent("copilot", SAMPLE_PAYLOAD, {
+      homeDir: home,
+      shell: "/opt/homebrew/bin/fish",
+      mode: "default",
+    });
+    const fishCfg = fs.readFileSync(
+      path.join(home, ".config", "fish", "config.fish"),
+      "utf8",
+    );
+    assert.match(fishCfg, /test -f '.*copilot\.env'; and source '.*copilot\.env'/);
+    undoAgent("copilot", { homeDir: home, shell: "/opt/homebrew/bin/fish" });
+    assert.equal(
+      fs.existsSync(path.join(home, ".config", "fish", "config.fish")),
+      false,
+    );
+  }));
+
+test("surgical previous-state restoration preserves post-install user edits across add, pause, resume, and undo", () =>
+  withTempHome((home) => {
+    const claudeSettings = path.join(home, ".claude", "settings.json");
+    const codexToml = path.join(home, ".codex", "config.toml");
+    fs.mkdirSync(path.dirname(claudeSettings), { recursive: true });
+    fs.mkdirSync(path.dirname(codexToml), { recursive: true });
+    fs.writeFileSync(
+      claudeSettings,
+      JSON.stringify({ permissions: { allow: ["Bash(ls)"] } }, null, 2),
+    );
+    fs.writeFileSync(codexToml, 'model = "o3"\n');
+
+    configureAgent("claude-code", SAMPLE_PAYLOAD, { homeDir: home, reasoningEffort: "high" });
+    configureAgent("codex", SAMPLE_PAYLOAD, { homeDir: home, reasoningEffort: "medium" });
+
+    // Simulate user adding hooks & MCP servers days AFTER HallPass was installed
+    const midClaude = JSON.parse(fs.readFileSync(claudeSettings, "utf8"));
+    midClaude.hooks = { PreToolUse: ["npm run lint"] };
+    fs.writeFileSync(claudeSettings, JSON.stringify(midClaude, null, 2));
+    fs.appendFileSync(codexToml, '\n[mcp_servers.post_install]\ncommand = "node"\n');
+
+    // Add a non-Claude model to Claude Code modelPicker
+    addModelToAgent("claude-code", "deepseek-v4.1-flash", {
+      homeDir: home,
+      catalogModels: [
+        ...SAMPLE_PAYLOAD.models,
+        {
+          id: "deepseek-v4.1-flash",
+          name: "DeepSeek V4.1 Flash",
+          provider: "DeepSeek",
+          protocols: ["messages", "chat/completions"],
+        },
+      ],
+    });
+    const withAdded = JSON.parse(fs.readFileSync(claudeSettings, "utf8"));
+    const dsEntry = withAdded.modelPicker.options.find(
+      (o) => o.model === "deepseek-v4.1-flash",
+    );
+    assert.equal(dsEntry.behavesAs, "claude-sonnet-4-6");
+
+    // Pause -> restores native defaults while preserving post-install hooks & MCP servers
+    pauseAgent("all", { homeDir: home });
+    assert.equal(inspectAgentConfig("claude-code", { homeDir: home }).paused, true);
+    assert.equal(inspectAgentConfig("codex", { homeDir: home }).paused, true);
+    const pausedClaude = JSON.parse(fs.readFileSync(claudeSettings, "utf8"));
+    assert.equal(pausedClaude.env, undefined);
+    assert.deepEqual(pausedClaude.hooks, { PreToolUse: ["npm run lint"] });
+    const pausedCodex = fs.readFileSync(codexToml, "utf8");
+    assert.match(pausedCodex, /^model = "o3"/m);
+    assert.match(pausedCodex, /\[mcp_servers\.post_install\]/);
+
+    // Resume -> re-applies HallPass while keeping post-install hooks & MCP servers
+    resumeAgent("all", { homeDir: home, catalogModels: SAMPLE_PAYLOAD.models });
+    assert.equal(inspectAgentConfig("claude-code", { homeDir: home }).paused, undefined);
+    assert.equal(
+      JSON.parse(fs.readFileSync(claudeSettings, "utf8")).env.ANTHROPIC_MODEL,
+      "claude-sonnet-4-6",
+    );
+
+    // Undo -> surgically removes HallPass without clobbering post-install hooks or MCP servers!
+    undoAgent("all", { homeDir: home });
+    const finalClaude = JSON.parse(fs.readFileSync(claudeSettings, "utf8"));
+    assert.equal(finalClaude.env, undefined);
+    assert.equal(finalClaude.modelPicker, undefined);
+    assert.deepEqual(finalClaude.permissions, { allow: ["Bash(ls)"] });
+    assert.deepEqual(finalClaude.hooks, { PreToolUse: ["npm run lint"] });
+
+    const finalCodex = fs.readFileSync(codexToml, "utf8");
+    assert.match(finalCodex, /^model = "o3"/m);
+    assert.doesNotMatch(finalCodex, /hallpass/);
+    assert.match(finalCodex, /\[mcp_servers\.post_install\]/);
+  }));
+
+test("interactive subscription guard, per-harness all-mode partial uninstall, agent aliases, and $0.00 status warning", async () => {
+  assert.equal(normalizeAgentName("claude"), "claude-code");
+  assert.equal(parseArgs(["run", "claude", "--", "-p", "Hi"]).agent, "claude-code");
+  assert.deepEqual(parseArgs(["run", "claude", "--", "-p", "Hi"]).passThroughArgs, [
+    "-p",
+    "Hi",
+  ]);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hp-guard-test-"));
+  const prevCfg = process.env.HALLPASS_CONFIG_DIR;
+  const prevDisableKc = process.env.HALLPASS_DISABLE_KEYCHAIN;
+  const prevHome = process.env.HOME;
+  process.env.HALLPASS_CONFIG_DIR = path.join(dir, ".config", "hallpass");
+  process.env.HALLPASS_DISABLE_KEYCHAIN = "1";
+  process.env.HOME = dir;
+
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".claude", ".credentials.json"),
+    JSON.stringify({ claudeAiOauth: { accessToken: "oauth_live" } }),
+  );
+  fs.mkdirSync(path.join(dir, ".codex"), { recursive: true });
+
+  const tokClaude = "hp_live_" + "c".repeat(43);
+  const tokCodex = "hp_live_" + "x".repeat(43);
+  const revokedTokens = [];
+
+  const server = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : null;
+    res.setHeader("Content-Type", "application/json");
+    if (req.url === "/api/core/pair/claim") {
+      res.end(
+        JSON.stringify({
+          operationId: "op_guard",
+          harness: body.harnesses ? "all" : "claude-code",
+          model: "claude-sonnet-4-6",
+          token: tokClaude,
+          tokensByHarness: {
+            "claude-code": tokClaude,
+            codex: tokCodex,
+          },
+          progressToken: "hp_pair_" + "c".repeat(43),
+          apiBase: `http://127.0.0.1:${server.address().port}/v1`,
+          models: SAMPLE_PAYLOAD.models,
+        }),
+      );
+    } else if (req.url === "/v1/models") {
+      res.end(
+        JSON.stringify({
+          object: "list",
+          data: [{ id: "claude-sonnet-4-6" }, { id: "gpt-5.4" }],
+        }),
+      );
+    } else if (req.url === "/api/core/pair/status") {
+      res.end(JSON.stringify({ ok: true, phase: body.phase }));
+    } else if (req.url === "/api/core/cli/revoke") {
+      revokedTokens.push(req.headers.authorization);
+      res.end(JSON.stringify({ ok: true, revoked: true }));
+    } else if (req.url?.startsWith("/api/core/cli/usage")) {
+      res.end(
+        JSON.stringify({
+          ok: true,
+          account: {
+            restricted: false,
+            debtMicros: "0",
+            availableMicros: "0",
+            heldMicros: "0",
+            completedRequests: 5,
+            totalCostMicros: "3000000",
+          },
+        }),
+      );
+    } else if (req.url === "/api/core/cli/event") {
+      res.end(JSON.stringify({ ok: true, recorded: true }));
+    } else {
+      res.statusCode = 404;
+      res.end("{}");
+    }
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+
+  try {
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const input = new PassThrough();
+    const output = new PassThrough();
+    // Press Enter on subscription guard -> selects [1] coexist!
+    input.end("\n");
+    const exit = await cliMain(
+      ["HPL-ABCD-2345", "--agent", "all", "--origin", base],
+      { interactive: true, input, output },
+    );
+    assert.equal(exit, 0);
+    assert.equal(
+      fs.existsSync(path.join(dir, ".claude", "settings.json")),
+      false,
+      "interactive subscription guard default [1] must keep ~/.claude/settings.json untouched",
+    );
+    assert.ok(
+      fs.existsSync(path.join(dir, ".config", "hallpass", "claude-settings.json")),
+    );
+
+    // Partial uninstall of codex revokes ONLY codex's dedicated token, leaving claude-code intact!
+    assert.equal(
+      await cliMain(["uninstall", "--agent", "codex", "--origin", base]),
+      0,
+    );
+    assert.deepEqual(revokedTokens, [`Bearer ${tokCodex}`]);
+
+    // Status with $0.00 balance succeeds and reports JSON ledger with availableMicros: "0"
+    const logs = [];
+    const origLog = console.log;
+    console.log = (...a) => logs.push(a.join(" "));
+    try {
+      assert.equal(await cliMain(["status", "--origin", base]), 0);
+    } finally {
+      console.log = origLog;
+    }
+    assert.ok(logs.some((l) => l.includes("Out of credits")));
+  } finally {
+    process.env.HOME = prevHome;
+    if (prevCfg === undefined) delete process.env.HALLPASS_CONFIG_DIR;
+    else process.env.HALLPASS_CONFIG_DIR = prevCfg;
+    if (prevDisableKc === undefined) delete process.env.HALLPASS_DISABLE_KEYCHAIN;
+    else process.env.HALLPASS_DISABLE_KEYCHAIN = prevDisableKc;
+    await new Promise((r) => server.close(r));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
