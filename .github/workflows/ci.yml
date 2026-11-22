@@ -26,3 +26,5 @@ jobs:
           node-version: ${{ matrix.node-version }}
       - run: npm test
       - run: npm pack --dry-run
+      - run: npm --prefix packages/ai-sdk-provider test
+      - run: npm pack --dry-run ./packages/ai-sdk-provider

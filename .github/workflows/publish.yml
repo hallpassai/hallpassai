@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+      - "ai-sdk-provider-v*"
   workflow_dispatch:
 
 permissions: {}
@@ -24,10 +25,12 @@ jobs:
         with:
           node-version: 22
           registry-url: "https://registry.npmjs.org"
-      - name: Run full CLI test suite and package verification
+      - name: Run full CLI and AI SDK provider test suites and package verification
         run: |
           npm test
           npm pack --dry-run
+          npm --prefix packages/ai-sdk-provider test
+          npm pack --dry-run ./packages/ai-sdk-provider
       - name: Publish with SLSA provenance on verified version tag
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -35,14 +38,28 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          pkg_ver="$(node -p "require('./package.json').version")"
-          if [ "${REF_TYPE}" != "tag" ] || [[ "${REF_NAME}" != v* ]]; then
+          cli_ver="$(node -p "require('./package.json').version")"
+          sdk_ver="$(node -p "require('./packages/ai-sdk-provider/package.json').version")"
+          if [ "${REF_TYPE}" != "tag" ]; then
             echo "Non-tag dispatch (${REF_NAME}) — running npm publish --dry-run only."
             npm publish --dry-run --access public
+            (cd packages/ai-sdk-provider && npm publish --dry-run --access public)
             exit 0
           fi
-          if [ "v${pkg_ver}" != "${REF_NAME}" ]; then
-            echo "Tag ${REF_NAME} does not match package.json version v${pkg_ver}" >&2
+          if [[ "${REF_NAME}" == ai-sdk-provider-v* ]]; then
+            if [ "ai-sdk-provider-v${sdk_ver}" != "${REF_NAME}" ]; then
+              echo "Tag ${REF_NAME} does not match packages/ai-sdk-provider/package.json version v${sdk_ver}" >&2
+              exit 1
+            fi
+            cd packages/ai-sdk-provider
+            npm publish --provenance --access public
+          elif [[ "${REF_NAME}" == v* ]]; then
+            if [ "v${cli_ver}" != "${REF_NAME}" ]; then
+              echo "Tag ${REF_NAME} does not match package.json version v${cli_ver}" >&2
+              exit 1
+            fi
+            npm publish --provenance --access public
+          else
+            echo "Unsupported release tag ${REF_NAME}" >&2
             exit 1
           fi
-          npm publish --provenance --access public

@@ -1,0 +1,47 @@
+{
+  "name": "@hallpassai/ai-sdk-provider",
+  "version": "0.1.0",
+  "description": "HallPass provider for the Vercel AI SDK.",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    }
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@ai-sdk/openai-compatible": ">=1.0.0",
+    "@ai-sdk/provider": ">=1.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "test": "node --test tests/provider.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hallpassai/hallpassai.git",
+    "directory": "packages/ai-sdk-provider"
+  },
+  "bugs": {
+    "url": "https://github.com/hallpassai/hallpassai/issues"
+  },
+  "homepage": "https://hallpassai.com",
+  "keywords": [
+    "ai-sdk",
+    "vercel-ai-sdk",
+    "hallpass",
+    "openai-compatible",
+    "llm"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
