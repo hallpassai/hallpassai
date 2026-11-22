@@ -25,6 +25,7 @@ import {
 import {
   normalizeCode,
   resolveOrigin,
+  validateEndpointUrl,
   isValidModelId,
   claimCode,
   fetchLiveModels,
@@ -488,6 +489,14 @@ export async function runBrowserAuthFlow({
   timeoutMs = 5 * 60 * 1000,
 } = {}) {
   const state = randomBytes(24).toString("base64url");
+  const expectedPrefix = (() => {
+    try {
+      const h = new URL(origin).hostname.toLowerCase();
+      if (h === "127.0.0.1" || h === "localhost" || h === "::1" || h === "[::1]") return "HPL";
+      if (h.startsWith("dev.")) return "HPD";
+    } catch {}
+    return "HP";
+  })();
   let resolveDone;
   let rejectDone;
   const resultPromise = new Promise((resolve, reject) => {
@@ -495,10 +504,24 @@ export async function runBrowserAuthFlow({
     rejectDone = reject;
   });
 
+  let boundPort = 0;
   const server = http.createServer((req, res) => {
-    const reqUrl = new URL(req.url || "/", "http://127.0.0.1");
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Connection", "close");
+    const hostHdr = String(req.headers.host || "").toLowerCase();
+    if (
+      (boundPort &&
+        hostHdr !== `127.0.0.1:${boundPort}` &&
+        hostHdr !== `localhost:${boundPort}`) ||
+      typeof req.url !== "string" ||
+      req.url.length > 512
+    ) {
+      res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("Bad request");
+      return;
+    }
+    const reqUrl = new URL(req.url || "/", "http://127.0.0.1");
     if (req.method !== "GET" || reqUrl.pathname !== "/callback") {
       res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
       res.end("Not found");
@@ -506,7 +529,7 @@ export async function runBrowserAuthFlow({
     }
     const gotState = reqUrl.searchParams.get("state") || "";
     const gotCode = normalizeCode(reqUrl.searchParams.get("code") || "");
-    if (!safeEqualStrings(gotState, state) || !gotCode) {
+    if (!safeEqualStrings(gotState, state) || !gotCode || gotCode.prefix !== expectedPrefix) {
       res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
       res.end("Invalid or expired authorization callback.");
       return;
@@ -518,6 +541,8 @@ export async function runBrowserAuthFlow({
     res.end(AUTH_SUCCESS_HTML);
     resolveDone(gotCode.code);
   });
+  server.headersTimeout = 5000;
+  server.requestTimeout = 5000;
 
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -525,6 +550,7 @@ export async function runBrowserAuthFlow({
   });
 
   const port = server.address().port;
+  boundPort = port;
   const authUrl = new URL("/start.html", origin);
   authUrl.searchParams.set("cli_port", String(port));
   authUrl.searchParams.set("cli_state", state);
@@ -534,12 +560,13 @@ export async function runBrowserAuthFlow({
   const isDefaultOpener = openBrowser === openSystemBrowser;
   const headless = noBrowser || (isDefaultOpener && isRemoteOrHeadlessEnv());
   const opened = headless ? false : Boolean(openBrowser(authUrl.href));
+  const verifyShort = state.slice(0, 6).toUpperCase();
 
   if (opened) {
-    console.log(`${dim("→")} Opening browser to sign in to HallPass…`);
+    console.log(`${dim("→")} Opening browser to sign in to HallPass ${dim(`[verify: ${verifyShort}]`)}…`);
     console.log(`  ${dim("If it didn't open:")} ${authUrl.href}`);
   } else {
-    console.log(`${bold("Sign in to HallPass in any browser:")}`);
+    console.log(`${bold("Sign in to HallPass in any browser:")} ${dim(`[verify: ${verifyShort}]`)}`);
     console.log(`  ${authUrl.href}`);
   }
   console.log(
@@ -556,6 +583,7 @@ export async function runBrowserAuthFlow({
       rl.close();
     } catch {}
     server.close();
+    server.closeAllConnections?.();
     fn(val);
   };
 
@@ -563,11 +591,15 @@ export async function runBrowserAuthFlow({
     const trimmed = String(line || "").trim();
     if (!trimmed) return;
     const parsed = normalizeCode(trimmed);
-    if (parsed) {
+    if (parsed && parsed.prefix === expectedPrefix) {
       finish(resolveDone, parsed.code);
+    } else if (parsed && parsed.prefix !== expectedPrefix) {
+      console.log(
+        dim(`  Pairing code prefix (${parsed.prefix}) does not match ${expectedPrefix}. Waiting for ${expectedPrefix}-XXXX-XXXX…`),
+      );
     } else {
       console.log(
-        dim("  Not a valid pairing code (expected HP-XXXX-XXXX). Waiting for browser callback…"),
+        dim(`  Not a valid pairing code (expected ${expectedPrefix}-XXXX-XXXX). Waiting for browser callback…`),
       );
     }
   });
@@ -1479,10 +1511,15 @@ export async function main(
     }
     const entry = creds.keys[chosenAgent] || first;
     const chosenModel = args.modelArg || entry.model;
+    if (!isValidModelId(chosenModel)) {
+      console.error(red(`Invalid model identifier: ${cleanLog(String(chosenModel))}`));
+      return 1;
+    }
+    const validatedApiBase = validateEndpointUrl(entry.apiBase);
     const chosenReasoning = args.reasoning || entry.reasoning || null;
     const spec = buildEphemeralLaunchSpec(chosenAgent, {
       token: entry.token,
-      apiBase: entry.apiBase,
+      apiBase: validatedApiBase,
       model: chosenModel,
       reasoning: chosenReasoning,
       catalogModels,

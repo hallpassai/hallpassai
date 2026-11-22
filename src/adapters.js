@@ -245,12 +245,15 @@ export function resolveRealBinary(cmd, env = process.env, homeDir = os.homedir()
     .filter(Boolean);
   const candidates = [];
   for (const d of dirs) {
-    if (path.resolve(d) === shimDir) continue;
-    const full = path.join(d, process.platform === "win32" ? `${cmd}.cmd` : cmd);
-    const plain = path.join(d, cmd);
+    // Reject relative PATH entries (e.g. `.` or `node_modules/.bin`) to prevent CWD binary hijacking.
+    if (!path.isAbsolute(d)) continue;
+    const resolvedDir = path.resolve(d);
+    if (resolvedDir === shimDir) continue;
+    const full = path.join(resolvedDir, process.platform === "win32" ? `${cmd}.cmd` : cmd);
+    const plain = path.join(resolvedDir, cmd);
     for (const p of process.platform === "win32" ? [full, plain] : [plain]) {
       try {
-        if (fs.existsSync(p) && fs.statSync(p).isFile()) candidates.push(p);
+        if (fs.existsSync(p) && fs.statSync(p).isFile()) candidates.push(path.resolve(p));
       } catch {}
     }
   }
@@ -1160,7 +1163,7 @@ export function configureAgent(
           (typeof currentCfg.model === "string" && !currentCfg.model.startsWith("hallpass/")),
       );
       const hasOtherAuth = Object.keys(currentAuth).some((k) => k !== "hallpass");
-      const backup = hasOtherProvider ? backupOnce(configPath) : null;
+      const backup = hasOtherProvider ? backupOnce(configPath, { secret: true }) : null;
       if (hasOtherAuth) backupOnce(authPath, { secret: true });
       writePrivateFile(configPath, cfgContent, 0o600);
       writePrivateFile(authPath, authContent, 0o600);

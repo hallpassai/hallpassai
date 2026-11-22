@@ -24,10 +24,40 @@ try {
   installedOpenAICompatible = null;
 }
 
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+
 function normalizeBaseURL(rawUrl) {
   const trimmed = typeof rawUrl === "string" ? rawUrl.trim() : "";
-  const resolved = trimmed || HALLPASS_BASE_URL;
-  return resolved.replace(/\/+$/, "");
+  const candidate = trimmed || HALLPASS_BASE_URL;
+  let parsed;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    throw new Error("Invalid HallPass baseURL.");
+  }
+  if (
+    parsed.username ||
+    parsed.password ||
+    parsed.search ||
+    parsed.hash ||
+    candidate.includes("?") ||
+    candidate.includes("#")
+  ) {
+    throw new Error(
+      "HallPass baseURL must not contain credentials, query parameters, or URL fragments.",
+    );
+  }
+  const isHttps = parsed.protocol === "https:";
+  const isLoopbackHttp =
+    parsed.protocol === "http:" &&
+    LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase());
+  if (!isHttps && !isLoopbackHttp) {
+    throw new Error(
+      "HallPass baseURL must use HTTPS (HTTP is only permitted on loopback).",
+    );
+  }
+  const cleanPath = parsed.pathname.replace(/\/+$/, "");
+  return `${parsed.origin}${cleanPath}`;
 }
 
 export function resolveHallPassApiKey(options = {}) {
@@ -46,7 +76,12 @@ function sanitizeHeaders(headers) {
   const clean = {};
   for (const [key, value] of Object.entries(headers)) {
     if (value !== undefined && value !== null) {
-      clean[key] = String(value);
+      const strKey = String(key);
+      const strVal = String(value);
+      if (/[\r\n\0]/.test(strKey) || /[\r\n\0]/.test(strVal)) {
+        throw new Error("Invalid control character in HallPass request header.");
+      }
+      clean[strKey] = strVal;
     }
   }
   return clean;
@@ -79,7 +114,11 @@ function assertValidModelId(modelId, methodName) {
 }
 
 function buildEndpointUrl(baseURL, routePath, queryParams) {
-  const url = new URL(`${baseURL}${routePath}`);
+  const safeBase = normalizeBaseURL(baseURL);
+  const url = new URL(safeBase);
+  const basePath = url.pathname.replace(/\/+$/, "");
+  const suffix = routePath.startsWith("/") ? routePath : `/${routePath}`;
+  url.pathname = `${basePath}${suffix}`;
   if (queryParams && typeof queryParams === "object") {
     for (const [key, value] of Object.entries(queryParams)) {
       if (value !== undefined && value !== null) {
@@ -90,12 +129,30 @@ function buildEndpointUrl(baseURL, routePath, queryParams) {
   return url.toString();
 }
 
+function mergeHeadersCaseInsensitive(...sources) {
+  const canonicalKey = new Map();
+  const values = {};
+  for (const src of sources) {
+    if (!src || typeof src !== "object") continue;
+    for (const [k, v] of Object.entries(src)) {
+      const lower = k.toLowerCase();
+      const prevKey = canonicalKey.get(lower);
+      if (prevKey && prevKey !== k) {
+        delete values[prevKey];
+      }
+      canonicalKey.set(lower, k);
+      values[k] = v;
+    }
+  }
+  return values;
+}
+
 function ensureAuthorizedHeaders(baseHeaders, requestHeaders) {
-  const merged = {
-    "Content-Type": "application/json",
-    ...baseHeaders,
-    ...sanitizeHeaders(requestHeaders),
-  };
+  const merged = mergeHeadersCaseInsensitive(
+    { "Content-Type": "application/json" },
+    sanitizeHeaders(baseHeaders),
+    sanitizeHeaders(requestHeaders),
+  );
   const hasAuth = Object.keys(merged).some(
     (key) => key.toLowerCase() === "authorization",
   );
@@ -105,6 +162,13 @@ function ensureAuthorizedHeaders(baseHeaders, requestHeaders) {
     );
   }
   return merged;
+}
+
+function redactErrorText(rawText) {
+  return String(rawText || "")
+    .slice(0, 8192)
+    .replace(/\b(?:hp_live|sk|rk)_[A-Za-z0-9_-]{8,}\b/g, "[redacted]")
+    .replace(/Bearer\s+[A-Za-z0-9_.-]{8,}/gi, "Bearer [redacted]");
 }
 
 function promptToMessages(prompt) {
@@ -203,13 +267,14 @@ function createStandaloneChatModel(modelId, settings = {}, config) {
         body: JSON.stringify(body),
         signal: callOptions.abortSignal,
       });
-      const rawText = await response.text();
+      const rawText = (await response.text()).slice(0, 1048576);
       if (!response.ok) {
+        const safeText = redactErrorText(rawText);
         const error = new Error(
-          `HallPass request failed with status ${response.status}: ${rawText}`,
+          `HallPass request failed with status ${response.status}: ${safeText}`,
         );
         error.statusCode = response.status;
-        error.responseBody = rawText;
+        error.responseBody = safeText;
         throw error;
       }
       const data = JSON.parse(rawText);
@@ -267,16 +332,64 @@ function createStandaloneChatModel(modelId, settings = {}, config) {
         signal: callOptions.abortSignal,
       });
       if (!response.ok || !response.body) {
-        const rawText = await response.text();
+        const safeText = redactErrorText(await response.text());
         const error = new Error(
-          `HallPass stream failed with status ${response.status}: ${rawText}`,
+          `HallPass stream failed with status ${response.status}: ${safeText}`,
         );
         error.statusCode = response.status;
-        error.responseBody = rawText;
+        error.responseBody = safeText;
         throw error;
       }
+      const decoder = new TextDecoder();
+      let carry = "";
+      let startedText = false;
+      let finishReason = "other";
+      let usage = { inputTokens: undefined, outputTokens: undefined, totalTokens: undefined };
+      const parsedStream = response.body.pipeThrough(
+        new TransformStream({
+          transform(chunk, controller) {
+            carry += typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
+            let nl;
+            while ((nl = carry.indexOf("\n")) >= 0) {
+              const line = carry.slice(0, nl).trimEnd();
+              carry = carry.slice(nl + 1);
+              if (!line.startsWith("data:")) continue;
+              const payload = line.slice(5).trim();
+              if (!payload || payload === "[DONE]") continue;
+              try {
+                const evt = JSON.parse(payload);
+                const choice = evt?.choices?.[0];
+                const deltaText = choice?.delta?.content;
+                if (typeof deltaText === "string" && deltaText.length > 0) {
+                  if (!startedText) {
+                    startedText = true;
+                    controller.enqueue({ type: "text-start", id: "0" });
+                  }
+                  controller.enqueue({ type: "text-delta", id: "0", delta: deltaText });
+                }
+                if (choice?.finish_reason) {
+                  finishReason = mapFinishReason(choice.finish_reason);
+                }
+                if (evt?.usage) {
+                  usage = {
+                    inputTokens: evt.usage.prompt_tokens,
+                    outputTokens: evt.usage.completion_tokens,
+                    totalTokens: evt.usage.total_tokens,
+                  };
+                }
+              } catch {}
+            }
+          },
+          flush(controller) {
+            if (startedText) {
+              controller.enqueue({ type: "text-end", id: "0" });
+            }
+            controller.enqueue({ type: "finish", finishReason, usage });
+          },
+        }),
+      );
       return {
-        stream: response.body,
+        stream: parsedStream,
         request: { body },
         response: {
           headers: Object.fromEntries(response.headers.entries()),
@@ -326,13 +439,14 @@ function createStandaloneEmbeddingModel(modelId, settings = {}, config) {
         body: JSON.stringify(body),
         signal: callOptions.abortSignal,
       });
-      const rawText = await response.text();
+      const rawText = (await response.text()).slice(0, 1048576);
       if (!response.ok) {
+        const safeText = redactErrorText(rawText);
         const error = new Error(
-          `HallPass embedding request failed with status ${response.status}: ${rawText}`,
+          `HallPass embedding request failed with status ${response.status}: ${safeText}`,
         );
         error.statusCode = response.status;
-        error.responseBody = rawText;
+        error.responseBody = safeText;
         throw error;
       }
       const data = JSON.parse(rawText);

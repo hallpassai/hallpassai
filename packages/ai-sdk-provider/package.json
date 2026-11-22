@@ -1,6 +1,6 @@
 {
   "name": "@hallpassai/ai-sdk-provider",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "HallPass provider for the Vercel AI SDK.",
   "license": "MIT",
   "type": "module",
@@ -16,8 +16,8 @@
     "LICENSE"
   ],
   "peerDependencies": {
-    "@ai-sdk/openai-compatible": ">=1.0.0",
-    "@ai-sdk/provider": ">=1.0.0"
+    "@ai-sdk/openai-compatible": "^1.0.0 || ^2.0.0",
+    "@ai-sdk/provider": "^1.0.0 || ^2.0.0 || ^3.0.0"
   },
   "engines": {
     "node": ">=20.0.0"

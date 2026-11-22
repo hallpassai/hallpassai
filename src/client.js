@@ -68,10 +68,12 @@ export function validateEndpointUrl(
     : `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`;
 }
 
-function registrableTail(hostname) {
-  const parts = hostname.toLowerCase().split(".");
-  return parts.length >= 2 ? parts.slice(-2).join(".") : hostname.toLowerCase();
-}
+const HALLPASS_FIRST_PARTY_HOSTS = new Set([
+  "hallpassai.com",
+  "app.hallpassai.com",
+  "dev.hallpassai.com",
+  "api.hallpassai.com",
+]);
 
 function assertApiBaseMatchesOrigin(apiBaseUrl, resolvedOriginUrl) {
   const api = new URL(apiBaseUrl);
@@ -85,10 +87,12 @@ function assertApiBaseMatchesOrigin(apiBaseUrl, resolvedOriginUrl) {
   if (api.protocol !== "https:") {
     throw new Error("Non-loopback apiBase must use HTTPS.");
   }
-  if (
-    api.hostname.toLowerCase() !== orig.hostname.toLowerCase() &&
-    registrableTail(api.hostname) !== registrableTail(orig.hostname)
-  ) {
+  const apiHost = api.hostname.toLowerCase();
+  const origHost = orig.hostname.toLowerCase();
+  const bothFirstPartyHallpass =
+    HALLPASS_FIRST_PARTY_HOSTS.has(apiHost) &&
+    HALLPASS_FIRST_PARTY_HOSTS.has(origHost);
+  if (apiHost !== origHost && !bothFirstPartyHallpass) {
     throw new Error(
       `Untrusted apiBase host "${api.hostname}" for origin "${orig.hostname}".`,
     );

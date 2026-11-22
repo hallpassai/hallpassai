@@ -271,6 +271,7 @@ export function purgeHallpassDir(
   const dir = hallpassDir(homeDir);
   for (const fileName of [
     "copilot.env",
+    "copilot.fish",
     "claude-settings.json",
     "previous-state.json",
     "read-key.mjs",
