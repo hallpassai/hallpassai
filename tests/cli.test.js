@@ -1010,7 +1010,7 @@ test("interactive subscription guard, per-harness all-mode partial uninstall, ag
     // Press Enter on subscription guard -> selects [1] coexist!
     input.end("\n");
     const exit = await cliMain(
-      ["HPL-ABCD-2345", "--agent", "all", "--origin", base],
+      ["HPL-ABCD-2345", "--agent", "all", "--no-launch", "--origin", base],
       { interactive: true, input, output },
     );
     assert.equal(exit, 0);
@@ -1114,6 +1114,7 @@ test("auth browser OAuth callback verifies state, rejects bad state, claims code
   try {
     const base = `http://127.0.0.1:${server.address().port}`;
     let openedUrl = null;
+    let callbackFlow = null;
     const input = new PassThrough();
     const output = new PassThrough();
     const exit = await cliMain(
@@ -1126,19 +1127,23 @@ test("auth browser OAuth callback verifies state, rejects bad state, claims code
           openedUrl = new URL(urlStr);
           const port = openedUrl.searchParams.get("cli_port");
           const state = openedUrl.searchParams.get("cli_state");
-          // First attempt with wrong state must be rejected with 400
-          void fetch(`http://127.0.0.1:${port}/callback?code=HPL-ABCD-2345&state=wrong_state`)
-            .then((r) => {
-              assert.equal(r.status, 400);
-              return fetch(`http://127.0.0.1:${port}/callback?code=HPL-ABCD-2345&state=${encodeURIComponent(state)}`);
-            })
-            .then((r) => {
-              assert.equal(r.status, 200);
-            });
+          callbackFlow = (async () => {
+            const r1 = await fetch(
+              `http://127.0.0.1:${port}/callback?code=HPL-ABCD-2345&state=wrong_state`,
+            );
+            assert.equal(r1.status, 400);
+            await r1.text();
+            const r2 = await fetch(
+              `http://127.0.0.1:${port}/callback?code=HPL-ABCD-2345&state=${encodeURIComponent(state)}`,
+            );
+            assert.equal(r2.status, 200);
+            await r2.text();
+          })();
           return true;
         },
       },
     );
+    await callbackFlow;
     assert.equal(exit, 0);
     assert.ok(openedUrl, "auth must invoke browser launch with cli_port and cli_state");
     assert.equal(openedUrl.searchParams.get("cli_agent"), "codex");

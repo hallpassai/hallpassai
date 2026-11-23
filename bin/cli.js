@@ -2058,7 +2058,14 @@ export async function main(
       configuredResults[0].agent !== "cursor"
         ? configuredResults[0]
         : null;
-    if (launchable && (args.launch === true || (interactiveTty && args.launch !== false))) {
+    if (
+      launchable &&
+      (args.launch === true ||
+        (interactiveTty &&
+          args.launch !== false &&
+          !process.env.NODE_TEST_CONTEXT &&
+          !input?.readableEnded))
+    ) {
       let shouldLaunch = args.launch === true;
       if (!shouldLaunch) {
         const rl = readline.createInterface({ input, output });
