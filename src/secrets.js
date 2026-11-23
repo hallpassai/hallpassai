@@ -181,7 +181,15 @@ export function readStoredCredentials(homeDir = os.homedir()) {
 
 export function storeCredential(
   harness,
-  { token, apiBase, model, reasoning = null, mode = "default", paused = false },
+  {
+    token,
+    apiBase,
+    model,
+    reasoning = null,
+    mode = "default",
+    paused = false,
+    continueWithSubscription = false,
+  },
   { homeDir = os.homedir(), useKeychain = process.platform === "darwin" } = {},
 ) {
   if (!/^[a-z0-9-]+$/.test(harness)) {
@@ -215,6 +223,7 @@ export function storeCredential(
     model,
     mode: mode === "coexist" ? "coexist" : "default",
     ...(paused ? { paused: true } : {}),
+    ...(continueWithSubscription ? { continueWithSubscription: true } : {}),
     ...(reasoning && reasoning !== "auto" ? { reasoning } : {}),
     updatedAt: new Date().toISOString(),
   };

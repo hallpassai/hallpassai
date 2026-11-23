@@ -15,6 +15,7 @@ import {
   configureAgent,
   addModelToAgent,
   buildEphemeralLaunchSpec,
+  prepareCodexSubscriptionResume,
   pauseAgent,
   resumeAgent,
   undoAgent,
@@ -109,19 +110,21 @@ function printHelp() {
   console.log(`${bold("hallpassai")} v${pkg.version} — Connect your coding tools to HallPass
 
 ${bold("Usage:")}
+  npx hallpassai setup [HARNESS] [PAIRING-CODE] [--default | --coexist]
   npx hallpassai auth [PAIRING-CODE] [--harness <name>]
   npx hallpassai add [MODEL-ID] [--harness <name>]
   npx hallpassai models [--provider <name>] [--search <query>]
   npx hallpassai use [MODEL-ID] [-r <level>] [--harness <name>]
   npx hallpassai run [HARNESS] [MODEL-ID] [-- <tool-args...>]
   npx hallpassai pause | resume [--harness <name>]
+  npx hallpassai pause codex --continue [--model <id>]
   npx hallpassai usage | status | doctor [--json]
   npx hallpassai uninstall [--harness <name>] [--keep-keys]
 
 ${bold("Options:")}
   --harness <name>       Target a specific tool (${SUPPORTED_AGENTS.join(", ")})
   -r, --reasoning <lvl>  Set reasoning depth (auto, none, minimal, low, medium, high, max, xhigh, ultra)
-  -m, --model <id>       Explicit model ID for \`add\`, \`use\`, or \`run\`
+  -m, --model <id>       Choose an explicit model
   --provider <name>      Filter \`models\` list by provider (e.g. Anthropic, OpenAI, DeepSeek)
   --search <query>       Search \`models\` list by name or ID
   --no-browser           Print login URL without opening a browser (for SSH / remote shells)
@@ -129,6 +132,7 @@ ${bold("Options:")}
   --json                 Output structured JSON for \`usage\` / \`status\`
   --dry-run              Preview configuration changes without claiming code or writing files
   --keep-keys            Keep server API keys active during uninstall (local cleanup only)
+  --continue            Pick a saved Codex thread to continue on your ChatGPT subscription
   --origin <url>         Override HallPass server origin
   -h, --help             Show help
   -v, --version          Show version
@@ -155,7 +159,8 @@ function printQuickControls(agent, appliedModel) {
   if (agent === "cursor") return;
   const inToolSwitch =
     agent === "opencode" ? "`/models` (or `Ctrl+T` for reasoning)" : "`/model`";
-  console.log(`  ${dim("in-session")} ${inToolSwitch} · ${dim("add model:")} \`npx hallpassai add ${cleanLog(appliedModel || "deepseek-v4.1-flash")}\` · ${dim("pause:")} \`npx hallpassai pause\``);
+  const action = agent === "opencode" || agent === "claude-code" ? "add" : "use";
+  console.log(`  ${dim("in-session")} ${inToolSwitch} · \`npx hallpassai ${action} ${cleanLog(appliedModel || "deepseek-v4.1-flash")} --harness ${agent}\` · \`npx hallpassai pause ${agent}\``);
 }
 
 export function parseArgs(argv) {
@@ -173,6 +178,7 @@ export function parseArgs(argv) {
     json: false,
     dryRun: false,
     keepKeys: false,
+    continueThread: false,
     origin: null,
     passThroughArgs: [],
   };
@@ -204,6 +210,10 @@ export function parseArgs(argv) {
     }
     if (a === "--keep-keys") {
       out.keepKeys = true;
+      continue;
+    }
+    if (a === "--continue") {
+      out.continueThread = true;
       continue;
     }
     if (a === "--coexist") {
@@ -326,6 +336,7 @@ export function parseArgs(argv) {
       }
       if (
         [
+          "setup",
           "auth",
           "login",
           "connect",
@@ -358,6 +369,13 @@ export function parseArgs(argv) {
                   : a;
         continue;
       }
+    }
+    if (out.command === "setup") {
+      const agent = normalizeAgentName(a);
+      if (SUPPORTED_AGENTS.includes(agent) && !out.agent) out.agent = agent;
+      else if (normalizeCode(a) && !out.code) out.code = a;
+      else throw new Error(`Unexpected setup argument: ${cleanLog(a)}. Use hallpassai setup <tool> [PAIRING-CODE].`);
+      continue;
     }
     if (
       ["run", "pause", "resume", "uninstall", "undo", "status", "doctor", "usage"].includes(
@@ -891,6 +909,32 @@ export async function pickModelInteractive(
   });
 }
 
+const toolNames = { "claude-code": "Claude Code", codex: "Codex", opencode: "OpenCode", copilot: "Copilot CLI", cursor: "Cursor" };
+const nativeCommand = (agent) => agent === "claude-code" ? "claude" : agent;
+const coexistHint = {
+  "claude-code": "Use the separate Claude launcher printed after setup for HallPass.",
+  codex: "Use `codex -p hallpass` for HallPass.",
+  opencode: "Choose a HallPass model from `/models` in OpenCode.",
+  copilot: "Use the separate Copilot launcher printed after setup for HallPass.",
+};
+
+async function chooseSetupOption(question, options, preferred, { input, output }) {
+  const rl = readline.createInterface({ input, output });
+  try {
+    output.write(`\n${question}\n`);
+    options.forEach((option, i) => output.write(`  ${i + 1}. ${option.label}\n`));
+    while (true) {
+      const answer = (await rl.question(`Choice [${preferred + 1}] or q to cancel: `)).trim();
+      if (/^(q|quit)$/i.test(answer)) return null;
+      if (!answer) return options[preferred].value;
+      if (/^[1-9]$/.test(answer) && options[Number(answer) - 1]) return options[Number(answer) - 1].value;
+      output.write("Enter a listed number or q.\n");
+    }
+  } finally {
+    rl.close();
+  }
+}
+
 export async function main(
   argv = process.argv.slice(2),
   {
@@ -903,6 +947,15 @@ export async function main(
 ) {
   const interactiveTty = isInteractiveTerminal({ input, output, interactive });
   const args = parseArgs(argv);
+  if (!argv.length && interactiveTty) {
+    const connected = Object.keys(readStoredCredentials().keys);
+    if (connected.length) {
+      console.log(`Configured tools: ${connected.map(cleanLog).join(", ")}. See routing with \`hallpassai status\`.`);
+      printHelp();
+      return 0;
+    }
+    args.command = "setup";
+  }
   if (args.command === "help") {
     printHelp();
     return 0;
@@ -910,6 +963,13 @@ export async function main(
   if (args.command === "version") {
     console.log(pkg.version);
     return 0;
+  }
+  if (args.continueThread && (
+    args.command !== "pause" || (args.agent && args.agent !== "codex") ||
+    args.code || args.passThroughArgs.length || args.dryRun
+  )) {
+    console.error(red("Use `hallpassai pause codex --continue` to pick a saved thread."));
+    return 1;
   }
   if (args.reasoning && !VALID_REASONING_LEVELS.has(args.reasoning)) {
     console.error(
@@ -938,7 +998,7 @@ export async function main(
 
   if (args.command === "pause" || args.command === "resume") {
     if (!validateAgentFlag()) return 1;
-    const target = args.agent || "all";
+    const target = args.agent || (args.continueThread ? "codex" : "all");
     const creds = readStoredCredentials();
     const first = Object.values(creds.keys || {})[0];
     if (!first) {
@@ -956,7 +1016,24 @@ export async function main(
         );
         return 1;
       }
-      const paused = pauseAgent(target);
+      let continuation;
+      if (args.continueThread) {
+        if (!interactiveTty) {
+          console.error(red("Run `hallpassai pause codex --continue` in an interactive terminal."));
+          return 1;
+        }
+        if (args.modelArg && !isValidModelId(args.modelArg)) {
+          console.error(red(`Invalid model identifier: ${cleanLog(args.modelArg)}`));
+          return 1;
+        }
+        try {
+          continuation = prepareCodexSubscriptionResume({ model: args.modelArg });
+        } catch (error) {
+          console.error(red(cleanLog(error.message)));
+          return 1;
+        }
+      }
+      const paused = pauseAgent(target, { codexSubscription: Boolean(continuation) });
       if (!paused.length) {
         console.error(red("No matching HallPass tools to pause."));
         return 1;
@@ -973,6 +1050,14 @@ export async function main(
         } else {
           console.log(`  ${dim("restored native default")} ${cleanLog(item.agent)}`);
         }
+      }
+      if (continuation) {
+        console.log("  Choose the thread to continue on your ChatGPT subscription.");
+      } else if (autoPaused.some((item) => item.continueWithSubscription)) {
+        console.log("  Open your saved conversation with `codex resume`. Its next turn uses your ChatGPT account.");
+        console.log(dim("  If your Codex version hides the thread, use `hallpassai pause codex --continue`."));
+      } else if (autoPaused.some(({ agent }) => agent === "codex")) {
+        console.log("  Continue a saved thread on your ChatGPT subscription with `npx hallpassai pause codex --continue`.");
       }
       if (autoPaused.length) {
         console.log(dim("  Re-enable anytime with `npx hallpassai resume` or run once with `npx hallpassai run`."));
@@ -994,6 +1079,16 @@ export async function main(
           fetcher ? { fetcher } : undefined,
         );
       }
+      if (continuation) {
+        const launched = spawnSync(continuation.command, continuation.args, {
+          stdio: "inherit",
+          env: continuation.env,
+        });
+        if (launched.error) {
+          console.error(red(`Could not launch Codex: ${cleanLog(launched.error.message)}`));
+        }
+        return launched.status ?? 1;
+      }
       return 0;
     }
     if (target !== "all" && !creds.keys?.[target]) {
@@ -1012,6 +1107,10 @@ export async function main(
       return 1;
     }
     for (const item of resumed) {
+      if (item.agent === "cursor") {
+        console.log(`  In Cursor Settings → Models, enable the saved HallPass base URL, then the OpenAI key. Select ${cleanLog(item.model)} in chat.`);
+        continue;
+      }
       console.log(
         `${green("✓")} Resumed ${bold(cleanLog(item.agent))} → ${bold(cleanLog(item.model))}`,
       );
@@ -1098,7 +1197,7 @@ export async function main(
       }
       if (hadCursor) {
         console.log(
-          `  ${dim("note")}    In Cursor → Settings → Models, toggle off Override OpenAI Base URL.`,
+          `  ${dim("note")}    In Cursor → Settings → Models, disable the OpenAI key and the base URL override, then select Auto in chat.`,
         );
       }
     } else {
@@ -1332,14 +1431,18 @@ export async function main(
   if (args.command === "add") {
     if (!validateAgentFlag()) return 1;
     const creds = readStoredCredentials();
-    const targets =
-      args.agent && args.agent !== "all"
-        ? [args.agent]
-        : Object.keys(creds.keys || {});
+    const explicit = args.agent && args.agent !== "all";
+    if (explicit && !["claude-code", "opencode"].includes(args.agent)) {
+      console.error(args.agent === "cursor" ? "Add the model in Cursor Settings → Models." :
+        `Picker registration is unavailable for ${args.agent}. To change its default, run \`hallpassai use ${cleanLog(args.modelArg || "<model>")} --harness ${args.agent}\`.`);
+      return 1;
+    }
+    const targets = explicit ? [args.agent] :
+      Object.keys(creds.keys || {}).filter((agent) => ["claude-code", "opencode"].includes(agent));
     if (!targets.length) {
       console.error(
         red(
-          "No HallPass tools configured yet. Run `npx hallpassai auth` first.",
+          "Set up Claude Code or OpenCode to add a model to its picker.",
         ),
       );
       return 1;
@@ -1491,7 +1594,11 @@ export async function main(
       );
       return 1;
     }
-    const first = creds.keys[configuredAgents[0]];
+    if (args.agent && args.agent !== "all" && !creds.keys[args.agent]) {
+      console.error(`Set up ${args.agent} first with \`hallpassai setup ${args.agent}\`.`);
+      return 1;
+    }
+    const first = creds.keys[args.agent] || creds.keys[configuredAgents[0]];
     const catalogModels = await fetchCatalogDetails(
       { apiBase: first?.apiBase, origin: args.origin },
       fetcher ? { fetcher } : undefined,
@@ -1509,7 +1616,7 @@ export async function main(
         chosenAgent = configuredAgents[0];
       }
     }
-    const entry = creds.keys[chosenAgent] || first;
+    const entry = creds.keys[chosenAgent];
     const chosenModel = args.modelArg || entry.model;
     if (!isValidModelId(chosenModel)) {
       console.error(red(`Invalid model identifier: ${cleanLog(String(chosenModel))}`));
@@ -1550,7 +1657,7 @@ export async function main(
       console.error(red(`Could not launch ${cleanLog(chosenAgent)}: ${cleanLog(launched.error.message)}`));
       return 1;
     }
-    return launched.status ?? 0;
+    return launched.status ?? 1;
   }
 
   if (args.command === "models") {
@@ -1853,7 +1960,49 @@ export async function main(
 
   if (!validateAgentFlag()) return 1;
 
-  if (args.command === "auth" && !args.code && !args.dryRun) {
+  const setup = args.command === "setup";
+  let savedSetup;
+  if (setup) {
+    if (args.agent === "all" || args.passThroughArgs.length || args.launch === true || args.modelArg) {
+      console.error("Use `hallpassai setup <tool>` for one tool. Select a model with `hallpassai use` after setup.");
+      return 1;
+    }
+    if (!args.agent) {
+      if (!interactiveTty) {
+        console.error(`Choose a tool: hallpassai setup <${SUPPORTED_AGENTS.join("|")}>.`);
+        return 1;
+      }
+      const installed = detectInstalledAgents(undefined, undefined, { fallback: false });
+      const choices = [...new Set([...installed, ...SUPPORTED_AGENTS])];
+      args.agent = await chooseSetupOption("Which coding tool do you want to set up?", choices.map((agent) => ({
+        value: agent, label: toolNames[agent] + (installed.includes(agent) ? " (detected)" : ""),
+      })), 0, { input, output });
+      if (!args.agent) return 0;
+    }
+    const agent = args.agent;
+    savedSetup = !args.code && readStoredCredentials().keys[agent];
+    if (args.dryRun && !args.mode && !interactiveTty) args.mode = savedSetup?.mode || (agent === "cursor" ? "default" : "coexist");
+    if (agent === "cursor" && args.mode === "coexist") {
+      console.error("Cursor uses a manual model configuration in Settings → Models.");
+      return 1;
+    }
+    if (!args.mode && agent !== "cursor") {
+      if (!interactiveTty) {
+        console.error("Choose --default to use HallPass credits or --coexist to keep your current default.");
+        return 1;
+      }
+      const keepDefault = savedSetup ? savedSetup.paused || savedSetup.mode === "coexist" : detectExistingSubscription(agent).detected;
+      args.mode = await chooseSetupOption(`How should ${toolNames[agent]} use HallPass?`, [
+        { value: "default", label: `Use HallPass credits when I open ${nativeCommand(agent)}` },
+        { value: "coexist", label: `Keep my current default. ${coexistHint[agent]}` },
+      ], keepDefault ? 1 : 0, { input, output });
+      if (!args.mode) return 0;
+    }
+    args.mode ||= "default";
+    args.launch = false;
+  }
+
+  if ((args.command === "auth" || setup) && !savedSetup && !args.code && !args.dryRun) {
     if (!interactiveTty) {
       console.error(
         red(
@@ -1874,7 +2023,7 @@ export async function main(
   }
 
   const parsedCode = args.code ? normalizeCode(args.code) : null;
-  if (!parsedCode) {
+  if (!parsedCode && !savedSetup && !(setup && args.dryRun)) {
     console.error(
       red("Run `npx hallpassai auth` to sign in, or pass a pairing code (`npx hallpassai auth HP-XXXX-XXXX`)."),
     );
@@ -1882,7 +2031,7 @@ export async function main(
   }
 
   if (args.dryRun) {
-    const resolvedOrigin = resolveOrigin(parsedCode.prefix, args.origin);
+    const resolvedOrigin = resolveOrigin(parsedCode?.prefix, args.origin);
     const previewApiBase =
       resolvedOrigin === "https://app.hallpassai.com"
         ? "https://api.hallpassai.com/v1"
@@ -1910,7 +2059,7 @@ export async function main(
       ],
     };
     console.log(
-      `${dim("→")} Previewing HallPass setup (pairing code ${parsedCode.code} NOT consumed)…`,
+      `${dim("→")} Previewing HallPass setup (no pairing code consumed)…`,
     );
     for (const agent of agents) {
       const res = configureAgent(agent, previewPayload, {
@@ -1934,13 +2083,28 @@ export async function main(
     targetHarness: args.agent || undefined,
   });
 
-  console.log(`${dim("→")} Claiming HallPass pairing code…`);
-  const claimed = await claimCode(args.code, {
-    origin: args.origin,
-    meta: claimMeta,
-    harnesses: !args.agent || args.agent === "all" ? detectedForAll : undefined,
-    ...(fetcher ? { fetcher } : {}),
-  });
+  let claimed;
+  if (savedSetup) {
+    if (!(await verifyGatewayReachable(savedSetup, fetcher ? { fetcher } : undefined))) {
+      console.error(`Could not verify the saved HallPass key for ${args.agent}. Check \`hallpassai doctor\` or rerun setup with a fresh pairing code.`);
+      return 1;
+    }
+    const models = await fetchCatalogDetails({ apiBase: savedSetup.apiBase, origin: args.origin }, fetcher ? { fetcher } : undefined);
+    claimed = { ...savedSetup, harness: args.agent, models };
+    args.reasoning ??= savedSetup.reasoning;
+  } else {
+    console.log(`${dim("→")} Claiming HallPass pairing code…`);
+    claimed = await claimCode(args.code, {
+      origin: args.origin,
+      meta: claimMeta,
+      expectedHarness: setup ? args.agent : undefined,
+      harnesses: setup ? [args.agent] : !args.agent || args.agent === "all" ? detectedForAll : undefined,
+      ...(fetcher ? { fetcher } : {}),
+    });
+    if (setup && claimed.harness !== args.agent && !claimed.tokensByHarness?.[args.agent]) {
+      throw new Error(`This code belongs to ${cleanLog(claimed.harness)}. Generate a code for ${args.agent}.`);
+    }
+  }
   const targetHarness = args.agent || claimed.harness;
   const agents =
     targetHarness === "all" ? detectedForAll : [targetHarness];
@@ -1995,6 +2159,10 @@ export async function main(
       const chosenMode = args.mode || (hasSub && promptedMode ? promptedMode : "default");
 
       const perAgentToken = claimed.tokensByHarness?.[agent] || claimed.token;
+      const prior = setup && readStoredCredentials().keys[agent];
+      if (prior && prior.mode !== "coexist" && !prior.paused && chosenMode === "coexist") {
+        pauseAgent(agent);
+      }
       const res = configureAgent(
         agent,
         { ...claimed, token: perAgentToken },
@@ -2022,12 +2190,18 @@ export async function main(
         );
         for (const f of res.files) console.log(`  ${dim("updated")} ${f}`);
         if (res.backup) console.log(`  ${dim("backup")}  ${res.backup}`);
-        printQuickControls(agent, res.appliedModel || claimed.model);
+        if (setup) {
+          if (chosenMode === "default") {
+            console.log(`  New ${toolNames[agent]} chats use HallPass credits. Restore your default with \`hallpassai pause ${agent}\`.`);
+          } else {
+            console.log(`  Plain ${nativeCommand(agent)} keeps your current default.`);
+          }
+        } else printQuickControls(agent, res.appliedModel || claimed.model);
       }
       console.log(`\n${bold("Next:")} ${res.nextStep}`);
     }
 
-    const reachable = await verifyGatewayReachable(
+    const reachable = Boolean(savedSetup) || await verifyGatewayReachable(
       claimed,
       fetcher ? { fetcher } : undefined,
     );
@@ -2036,7 +2210,7 @@ export async function main(
         `${dim("✓ Verified gateway connection (0 credits used). Pause anytime with `npx hallpassai pause` · Cleanup with `npx hallpassai uninstall`.")}`,
       );
     }
-    await sendPairingStatus(
+    if (!savedSetup) await sendPairingStatus(
       {
         origin: claimed.resolvedOrigin,
         progressToken: claimed.progressToken,
@@ -2101,7 +2275,7 @@ export async function main(
 
     return 0;
   } catch (err) {
-    await sendPairingStatus(
+    if (!savedSetup) await sendPairingStatus(
       {
         origin: claimed.resolvedOrigin,
         progressToken: claimed.progressToken,

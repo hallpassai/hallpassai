@@ -168,7 +168,7 @@ function resolveOpencodeDirs(homeDir, env = process.env) {
   return { configDir, dataDir };
 }
 
-export function detectInstalledAgents(homeDir = os.homedir(), env = process.env) {
+export function detectInstalledAgents(homeDir = os.homedir(), env = process.env, { fallback = true } = {}) {
   const found = [];
   const hasCmd = (cmd) => {
     const res = spawnSync(
@@ -189,7 +189,7 @@ export function detectInstalledAgents(homeDir = os.homedir(), env = process.env)
   )
     found.push("opencode");
   if (hasCmd("copilot")) found.push("copilot");
-  return found.length ? found : ["claude-code"];
+  return found.length || !fallback ? found : ["claude-code"];
 }
 
 export function detectExistingSubscription(agent, homeDir = os.homedir()) {
@@ -210,7 +210,7 @@ export function detectExistingSubscription(agent, homeDir = os.homedir()) {
         }
       }
     } else if (agent === "codex") {
-      const authFile = path.join(homeDir, ".codex", "auth.json");
+      const authFile = path.join(resolveCodexDir(homeDir), "auth.json");
       if (fs.existsSync(authFile)) {
         const j = readJsonSafe(authFile);
         if (j?.tokens || j?.OPENAI_API_KEY) {
@@ -311,6 +311,7 @@ const CODEX_HALLPASS_PROFILES = new Set([
   "profiles.balanced",
   "profiles.deep",
 ]);
+const CODEX_SUBSCRIPTION_ENDPOINT = "https://chatgpt.com/backend-api/codex";
 
 export const VALID_REASONING_LEVELS = new Set([
   "auto",
@@ -458,6 +459,7 @@ export function upsertCodexToml(
     `base_url = ${tomlBasicString(apiBase)}`,
     `wire_api = "responses"`,
     `supports_websockets = false`,
+    `requires_openai_auth = false`,
     "",
     "[model_providers.hallpass.auth]",
     `command = ${tomlBasicString(nodePath)}`,
@@ -1366,7 +1368,7 @@ export function configureAgent(
         model: chosenModel,
       },
       nextStep:
-        "In Cursor → Settings → Models: paste OpenAI API Key, enable Override OpenAI Base URL, and add the model.",
+        "In Cursor → Settings → Models, save the HallPass base URL first, then enable the OpenAI API key and select the model in chat.",
     };
   }
 
@@ -1448,22 +1450,9 @@ export function addModelToAgent(
     return { agent, model: modelId, files: [cfgPath], hint: `Run \`opencode -m hallpass/${modelId}\` or select in \`/models\`.` };
   }
 
-  if (agent === "codex" || agent === "copilot" || agent === "cursor") {
-    const switched = switchAgentModel(agent, modelId, {
-      homeDir,
-      catalogModels: catalogModels.length ? catalogModels : [mObj],
-    });
-    return {
-      agent,
-      model: switched.appliedModel || modelId,
-      files: switched.files || [],
-      hint:
-        agent === "codex"
-          ? "Set as active Codex model (switch anytime via `/model`)."
-          : agent === "copilot"
-            ? "Updated Copilot model (re-source `~/.config/hallpass/copilot.env` in open shells)."
-            : `Add "${modelId}" under Cursor → Settings → Models.`,
-    };
+  if (agent === "cursor") throw new Error(`Add "${modelId}" in Cursor Settings → Models.`);
+  if (agent === "codex" || agent === "copilot") {
+    throw new Error(`Picker registration is unavailable for ${agent}. To change its default, run \`hallpassai use ${modelId} --harness ${agent}\`.`);
   }
   throw new Error(`Unsupported agent: ${agent}`);
 }
@@ -1530,7 +1519,16 @@ export function buildEphemeralLaunchSpec(
 
   if (agent === "codex") {
     const codexBin = resolveRealBinary("codex", cleanEnv, homeDir);
-    const providerInline = `model_providers.hallpass={name="HallPass",base_url=${tomlBasicString(apiBase)},wire_api="responses",supports_websockets=false,env_key="HALLPASS_API_KEY"}`;
+    const configPath = path.join(resolveCodexDir(homeDir, cleanEnv), "config.toml");
+    const existingConfig = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
+    const hasAuthCommand = existingConfig.split("\n").some(
+      (line) => line.match(TOML_HEADER_RE)?.[2].trim() === "model_providers.hallpass.auth",
+    );
+    // Codex merges the override into the saved provider and rejects auth combined with env_key.
+    const auth = hasAuthCommand
+      ? `auth={command=${tomlBasicString(process.execPath)},args=["-e", "process.stdout.write(process.env.HALLPASS_API_KEY || '')"],timeout_ms=6000}`
+      : 'env_key="HALLPASS_API_KEY"';
+    const providerInline = `model_providers.hallpass={name="HallPass",base_url=${tomlBasicString(apiBase)},wire_api="responses",supports_websockets=false,requires_openai_auth=false,${auth}}`;
     const isGpt6 = /^gpt-6/i.test(model);
     const rawEff =
       reasoning === "none"
@@ -1667,6 +1665,64 @@ function mergeCodexRestoredRootLines(restoredRootLines, cleanedToml) {
     : `${restoredRootLines.join("\n")}\n`;
 }
 
+function codexSubscriptionLogin(homeDir) {
+  const command = resolveRealBinary("codex", process.env, homeDir);
+  const env = { ...process.env, CODEX_HOME: resolveCodexDir(homeDir) };
+  delete env.OPENAI_API_KEY;
+  delete env.CODEX_API_KEY;
+  delete env.HALLPASS_API_KEY;
+  const query = (args) => spawnSync(command, args, { env, encoding: "utf8", timeout: 5000 });
+  const login = query(["login", "status"]);
+  return {
+    command, env, query,
+    installed: login.error?.code !== "ENOENT",
+    chatgpt: login.status === 0 && /logged in using chatgpt/i.test(`${login.stdout}\n${login.stderr}`),
+  };
+}
+
+export function prepareCodexSubscriptionResume({ homeDir = os.homedir(), model } = {}) {
+  const { command, env, query, installed, chatgpt } = codexSubscriptionLogin(homeDir);
+  if (!installed) throw new Error("Install Codex to continue a thread.");
+  if (!chatgpt) {
+    throw new Error("Sign in to ChatGPT with `codex login`, then retry `hallpassai pause codex --continue`.");
+  }
+  if (!model) {
+    const fp = path.join(resolveCodexDir(homeDir), "config.toml");
+    const raw = fs.existsSync(fp) ? fs.readFileSync(fp, "utf8") : "";
+    const root = raw.split(/^\s*\[/m, 1)[0];
+    const prior = readPreviousState(homeDir).codex;
+    const providerPattern = /^\s*model_provider\s*=\s*["']([^"']+)["']/m;
+    const nativeConfig = root.match(providerPattern)?.[1] === "hallpass"
+      ? [prior?.modelLine, prior?.providerLine].join("\n")
+      : root;
+    if ((nativeConfig.match(providerPattern)?.[1] ?? "openai") === "openai") {
+      model = nativeConfig.match(/^\s*model\s*=\s*["']([a-zA-Z0-9._-]+)["']/m)?.[1];
+    }
+  }
+  if (!model) {
+    const catalog = query(["debug", "models", "--bundled"]);
+    if (catalog.status === 0) {
+      try {
+        model = JSON.parse(catalog.stdout).models
+          .filter((item) => item.visibility === "list")
+          .sort((first, second) => first.priority - second.priority)[0]?.slug;
+      } catch {}
+    }
+    if (!model) throw new Error("Could not resolve your Codex model. Retry with `--model <model>`.");
+  }
+  return {
+    command,
+    env,
+    args: [
+      "resume", "--no-daemon", "--all", "--include-non-interactive", "-m", model,
+      "-c", 'forced_login_method="chatgpt"',
+      "-c", 'model_provider="hallpass"',
+      "-c", 'model_providers.hallpass.requires_openai_auth=true',
+      "-c", `model_providers.hallpass.base_url=${tomlBasicString(CODEX_SUBSCRIPTION_ENDPOINT)}`,
+    ],
+  };
+}
+
 function surgicallyRestoreGlobalConfig(
   a,
   {
@@ -1674,6 +1730,7 @@ function surgicallyRestoreGlobalConfig(
     shell = process.env.SHELL || "/bin/zsh",
     keepAdditive = false,
     savedEntry = null,
+    codexSubscription = false,
   } = {},
 ) {
   const touched = [];
@@ -1762,11 +1819,10 @@ function surgicallyRestoreGlobalConfig(
   } else if (a === "codex") {
     const codexDir = resolveCodexDir(homeDir);
     const fp = path.join(codexDir, "config.toml");
-    if (fs.existsSync(fp)) {
+    if (fs.existsSync(fp) || codexSubscription) {
       assertNotSymlink(fp);
-      const raw = fs.readFileSync(fp, "utf8");
+      const raw = fs.existsSync(fp) ? fs.readFileSync(fp, "utf8") : "";
       if (keepAdditive) {
-        // Keep `[model_providers.hallpass]` dormant, restore root keys only
         const strippedRoot = stripHallpassFromCodexToml(raw, {
           removeTopLevelProvider: true,
         });
@@ -1778,7 +1834,7 @@ function surgicallyRestoreGlobalConfig(
           prev?.webSearchLine,
         ].filter(Boolean);
         const baseToml = mergeCodexRestoredRootLines(restoredRootLines, strippedRoot).trim();
-        const withProvider = upsertCodexToml(baseToml, {
+        const hallpassProvider = {
           model: "gpt-6.1-sol",
           apiBase:
             savedEntry?.apiBase ||
@@ -1787,8 +1843,29 @@ function surgicallyRestoreGlobalConfig(
           nodePath: process.execPath,
           helperPath,
           providerOnly: true,
-        });
-        writePrivateFile(fp, withProvider, 0o600);
+        };
+        if (codexSubscription) {
+          if (savedEntry?.mode === "coexist") {
+            const profilePath = path.join(codexDir, "hallpass.config.toml");
+            assertNotSymlink(profilePath);
+            const profile = fs.existsSync(profilePath)
+              ? fs.readFileSync(profilePath, "utf8")
+              : buildCodexProfileToml({ model: savedEntry.model, reasoningEffort: savedEntry.reasoning });
+            writePrivateFile(profilePath, upsertCodexToml(profile, hallpassProvider), 0o600);
+            touched.push(profilePath);
+          }
+          const subscriptionProvider = [
+            "[model_providers.hallpass]",
+            'name = "OpenAI"',
+            `base_url = ${tomlBasicString(CODEX_SUBSCRIPTION_ENDPOINT)}`,
+            'wire_api = "responses"',
+            "supports_websockets = false",
+            "requires_openai_auth = true",
+          ].join("\n");
+          writePrivateFile(fp, `${baseToml ? `${baseToml}\n\n` : ""}${subscriptionProvider}\n`, 0o600);
+        } else {
+          writePrivateFile(fp, upsertCodexToml(baseToml, hallpassProvider), 0o600);
+        }
       } else {
         const cleaned = stripHallpassFromCodexToml(raw, {
           removeTopLevelProvider: true,
@@ -1923,7 +2000,7 @@ function surgicallyRestoreGlobalConfig(
 
 export function pauseAgent(
   agent = "all",
-  { homeDir = os.homedir(), shell = process.env.SHELL || "/bin/zsh" } = {},
+  { homeDir = os.homedir(), shell = process.env.SHELL || "/bin/zsh", codexSubscription = false } = {},
 ) {
   const creds = readStoredCredentials(homeDir);
   const targets =
@@ -1941,15 +2018,23 @@ export function pauseAgent(
         agent: a,
         files: [],
         manual: true,
-        note: "Turn off Override OpenAI Base URL in Cursor → Settings → Models to pause HallPass.",
+        note: "In Cursor → Settings → Models, turn off the OpenAI API key and Override OpenAI Base URL, then select Auto in chat.",
       });
       continue;
+    }
+    let continueWithSubscription = false;
+    if (a === "codex") {
+      const priorProvider = readPreviousState(homeDir).codex?.providerLine;
+      const restoringOpenAI = !priorProvider || /^\s*model_provider\s*=\s*["']openai["']/.test(priorProvider);
+      continueWithSubscription = codexSubscription || info.continueWithSubscription ||
+        (info.mode !== "coexist" && restoringOpenAI && codexSubscriptionLogin(homeDir).chatgpt);
     }
     const files = surgicallyRestoreGlobalConfig(a, {
       homeDir,
       shell,
       keepAdditive: true,
       savedEntry: info,
+      codexSubscription: continueWithSubscription,
     });
     storeCredential(
       a,
@@ -1960,10 +2045,11 @@ export function pauseAgent(
         reasoning: info.reasoning || null,
         mode: info.mode || "default",
         paused: true,
+        continueWithSubscription,
       },
       { homeDir },
     );
-    updated.push({ agent: a, files });
+    updated.push({ agent: a, files, continueWithSubscription });
   }
   return updated;
 }

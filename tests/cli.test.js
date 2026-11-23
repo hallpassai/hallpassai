@@ -17,6 +17,7 @@ import {
   inspectAgentConfig,
   detectExistingSubscription,
   switchAgentModel,
+  buildEphemeralLaunchSpec,
   upsertCodexToml,
   stripJsonc,
   normalizeCode,
@@ -822,6 +823,13 @@ test("coexist mode keeps existing logins & dotfiles untouched across claude-code
     assert.ok(fs.existsSync(path.join(home, ".config", "hallpass", "bin", "copilot-hp")));
     assert.equal(inspectAgentConfig("copilot", { homeDir: home, shell: "/bin/zsh" }).ok, true);
 
+    pauseAgent("codex", { homeDir: home, codexSubscription: true });
+    assert.match(fs.readFileSync(codexToml, "utf8"), /requires_openai_auth = true/);
+    const coexistProfile = fs.readFileSync(path.join(home, ".codex", "hallpass.config.toml"), "utf8");
+    assert.match(coexistProfile, /requires_openai_auth = false/);
+    assert.match(coexistProfile, /base_url = "https:\/\/api\.hallpassai\.com\/v1"/);
+    assert.match(coexistProfile, /\[model_providers\.hallpass\.auth\]/);
+
     undoAgent("all", { homeDir: home, shell: "/bin/zsh", fullCleanup: true });
     assert.equal(fs.existsSync(path.join(home, ".config", "hallpass")), false);
     assert.equal(fs.existsSync(path.join(home, ".codex", "hallpass.config.toml")), false);
@@ -898,9 +906,40 @@ test("surgical previous-state restoration preserves post-install user edits acro
     assert.match(pausedCodex, /^model = "o3"/m);
     assert.match(pausedCodex, /\[mcp_servers\.post_install\]/);
 
+    const launch = buildEphemeralLaunchSpec("codex", {
+      token: SAMPLE_PAYLOAD.token,
+      apiBase: SAMPLE_PAYLOAD.apiBase,
+      model: "gpt-5.4",
+      extraArgs: ["resume", "saved-thread"],
+      homeDir: home,
+    });
+    assert.match(launch.args[1], /auth=\{command=/);
+    assert.doesNotMatch(launch.args[1], /env_key=/);
+    assert.equal(launch.env.HALLPASS_API_KEY, SAMPLE_PAYLOAD.token);
+    assert.deepEqual(launch.args.slice(-2), ["resume", "saved-thread"]);
+    assert.equal(fs.readFileSync(codexToml, "utf8"), pausedCodex);
+
+    pauseAgent("codex", { homeDir: home, codexSubscription: true });
+    const subscriptionConfig = fs.readFileSync(codexToml, "utf8");
+    assert.match(subscriptionConfig, /^model = "o3"/m);
+    assert.match(subscriptionConfig, /base_url = "https:\/\/chatgpt\.com\/backend-api\/codex"/);
+    assert.match(subscriptionConfig, /requires_openai_auth = true/);
+    assert.doesNotMatch(subscriptionConfig, /model_providers\.hallpass\.auth/);
+    assert.match(subscriptionConfig, /\[mcp_servers\.post_install\]/);
+    pauseAgent("codex", { homeDir: home });
+    assert.equal(fs.readFileSync(codexToml, "utf8"), subscriptionConfig);
+    const hallpassLaunch = buildEphemeralLaunchSpec("codex", {
+      token: SAMPLE_PAYLOAD.token,
+      apiBase: SAMPLE_PAYLOAD.apiBase,
+      model: "gpt-5.4",
+      homeDir: home,
+    });
+    assert.match(hallpassLaunch.args[1], /requires_openai_auth=false,env_key="HALLPASS_API_KEY"/);
+
     // Resume -> re-applies HallPass while keeping post-install hooks & MCP servers
     resumeAgent("all", { homeDir: home, catalogModels: SAMPLE_PAYLOAD.models });
     assert.equal(inspectAgentConfig("claude-code", { homeDir: home }).paused, undefined);
+    assert.match(fs.readFileSync(codexToml, "utf8"), /\[model_providers\.hallpass\.auth\]/);
     assert.equal(
       JSON.parse(fs.readFileSync(claudeSettings, "utf8")).env.ANTHROPIC_MODEL,
       "claude-sonnet-4-6",
@@ -1052,7 +1091,7 @@ test("interactive subscription guard, per-harness all-mode partial uninstall, ag
 });
 
 
-test("auth browser OAuth callback verifies state, rejects bad state, claims code, and supports non-OpenAI Codex add", async () => {
+test("auth browser OAuth callback verifies state, rejects bad state, claims code, and keeps picker registration separate from changing the Codex default", async () => {
   assert.equal(parseArgs(["auth"]).command, "auth");
   assert.equal(parseArgs(["login"]).command, "auth");
   assert.equal(parseArgs(["auth", "HPL-ABCD-2345"]).code, "HPL-ABCD-2345");
@@ -1148,9 +1187,11 @@ test("auth browser OAuth callback verifies state, rejects bad state, claims code
     assert.ok(openedUrl, "auth must invoke browser launch with cli_port and cli_state");
     assert.equal(openedUrl.searchParams.get("cli_agent"), "codex");
 
-    // Adding a non-OpenAI /v1/responses model (deepseek-v4.1-flash) to Codex now succeeds!
-    const addExit = await cliMain(["add", "deepseek-v4.1-flash", "--agent", "codex", "--origin", base]);
-    assert.equal(addExit, 0);
+    const configPath = path.join(dir, ".codex", "config.toml");
+    const savedConfig = fs.readFileSync(configPath, "utf8");
+    assert.equal(await cliMain(["add", "deepseek-v4.1-flash", "--agent", "codex", "--origin", base]), 1);
+    assert.equal(fs.readFileSync(configPath, "utf8"), savedConfig);
+    assert.equal(await cliMain(["use", "deepseek-v4.1-flash", "--agent", "codex", "--origin", base]), 0);
     const codexToml = fs.readFileSync(path.join(dir, ".codex", "config.toml"), "utf8");
     assert.match(codexToml, /model = "deepseek-v4\.1-flash"/);
   } finally {
@@ -1239,7 +1280,13 @@ test("add without model opens filterable picker with top 5 popular models first,
   const prevHome = process.env.HOME;
   process.env.HALLPASS_CONFIG_DIR = path.join(dir, ".config", "hallpass");
   process.env.HALLPASS_DISABLE_KEYCHAIN = "1";
+  const priorXdg = {
+    XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+    XDG_DATA_HOME: process.env.XDG_DATA_HOME,
+  };
   process.env.HOME = dir;
+  process.env.XDG_CONFIG_HOME = path.join(dir, ".config");
+  process.env.XDG_DATA_HOME = path.join(dir, ".local", "share");
 
   const server = http.createServer((req, res) => {
     res.setHeader("Content-Type", "application/json");
@@ -1257,7 +1304,7 @@ test("add without model opens filterable picker with top 5 popular models first,
   try {
     const base = `http://127.0.0.1:${server.address().port}`;
     configureAgent(
-      "codex",
+      "opencode",
       {
         token: "hp_live_" + "p".repeat(43),
         apiBase: `${base}/v1`,
@@ -1269,7 +1316,7 @@ test("add without model opens filterable picker with top 5 popular models first,
 
     // Non-interactive without model fails fast
     assert.equal(
-      await cliMain(["add", "--agent", "codex", "--origin", base], { interactive: false }),
+      await cliMain(["add", "--agent", "opencode", "--origin", base], { interactive: false }),
       1,
     );
 
@@ -1277,16 +1324,21 @@ test("add without model opens filterable picker with top 5 popular models first,
     const pipeIn = new PassThrough();
     const pipeOut = new PassThrough();
     pipeIn.end("1\n");
-    const exit = await cliMain(["add", "--agent", "codex", "--origin", base], {
+    const exit = await cliMain(["add", "--agent", "opencode", "--origin", base], {
       interactive: true,
       input: pipeIn,
       output: pipeOut,
     });
     assert.equal(exit, 0);
-    const toml = fs.readFileSync(path.join(dir, ".codex", "config.toml"), "utf8");
-    assert.match(toml, /model = "deepseek-v4\.1-flash"/);
+    const config = JSON.parse(fs.readFileSync(path.join(dir, ".config", "opencode", "opencode.json"), "utf8"));
+    assert.ok(config.provider.hallpass.models["deepseek-v4.1-flash"]);
+    assert.equal(config.model, "hallpass/gpt-6.1-sol");
   } finally {
     process.env.HOME = prevHome;
+    for (const [name, value] of Object.entries(priorXdg)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
     if (prevCfg === undefined) delete process.env.HALLPASS_CONFIG_DIR;
     else process.env.HALLPASS_CONFIG_DIR = prevCfg;
     if (prevDisableKc === undefined) delete process.env.HALLPASS_DISABLE_KEYCHAIN;
@@ -1301,6 +1353,7 @@ test("CLI safety regressions: positional uninstall/pause agent, Codex pause->uni
     // 1. parseArgs parses positional harness name for uninstall/pause/resume (never silently widens to 'all')
     assert.equal(parseArgs(["uninstall", "codex"]).agent, "codex");
     assert.equal(parseArgs(["pause", "claude"]).agent, "claude-code");
+    assert.equal(parseArgs(["pause", "codex", "--continue"]).continueThread, true);
     assert.equal(parseArgs(["resume", "opencode"]).agent, "opencode");
 
     // 2. stripJsonc preserves ',}' inside string literals

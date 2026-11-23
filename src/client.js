@@ -281,7 +281,7 @@ export function buildCliMeta({
 
 export async function claimCode(
   code,
-  { origin, meta = null, harnesses = null, fetcher = fetch } = {},
+  { origin, meta = null, harnesses = null, expectedHarness = null, fetcher = fetch } = {},
 ) {
   const parsed = normalizeCode(code);
   if (!parsed) {
@@ -301,6 +301,7 @@ export async function claimCode(
     body: JSON.stringify({
       code: parsed.code,
       ...(meta ? { meta } : {}),
+      ...(expectedHarness ? { expectedHarness } : {}),
       ...(Array.isArray(harnesses) && harnesses.length ? { harnesses } : {}),
     }),
     signal: AbortSignal.timeout(15000),
@@ -316,6 +317,7 @@ export async function claimCode(
         "Pairing code not recognized. Copy a fresh code from HallPass Connect.",
       pairing_expired:
         "This pairing code expired (codes last 10 minutes). Generate a fresh one on HallPass Connect.",
+      pairing_harness_mismatch: "This pairing code is for a different tool. Get a code for the selected tool.",
       pairing_already_used:
         "This pairing code was already used. Generate a fresh code if you need to re-pair.",
       account_restricted:

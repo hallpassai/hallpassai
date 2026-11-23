@@ -46,6 +46,12 @@ for await (const delta of result.textStream) {
 }
 ```
 
+### Chat models and reasoning
+
+Use `hallpass.chatModel("gpt-6.1-sol")` or `hallpass.chatModel("deepseek-v4.1-flash")` for Chat Completions. Requests use the HallPass key configured in your application. For direct calls to `POST /v1/chat/completions`, set `reasoning_effort` to a level supported by the model. The gateway also accepts the `reasoning` string sent by Cursor Desktop. On `POST /v1/responses`, use a `reasoning` object with an `effort` field.
+
+For Cursor Ask or Agent, run `npx hallpassai setup cursor` and follow the [Cursor setup guide](https://github.com/hallpassai/hallpassai#cursor-desktop).
+
 ### Custom Provider Configuration
 
 Use `createHallPass` to override `apiKey`, `baseURL`, custom `headers`, `queryParams`, or `fetch`:
