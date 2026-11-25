@@ -588,6 +588,11 @@ test("packed npm tarball extracts cleanly and runs real CLI subprocess across al
           models: SAMPLE_PAYLOAD.models,
         }),
       );
+    } else if (req.url === "/api/core/catalog") {
+      res.end(JSON.stringify({ models: [...SAMPLE_PAYLOAD.models, {
+        id: "abliteration-abliterated-model-large-v2", name: "Abliterated Large V2",
+        protocols: ["messages", "responses", "chat/completions"],
+      }] }));
     } else if (req.url === "/v1/models") {
       res.end(
         JSON.stringify({
@@ -645,6 +650,24 @@ test("packed npm tarball extracts cleanly and runs real CLI subprocess across al
     assert.ok(fs.existsSync(path.join(home, ".config", "opencode", "opencode.json")));
     assert.ok(fs.existsSync(path.join(home, ".config", "hallpass", "copilot.env")));
 
+    // Cursor Desktop is paired explicitly even on machines with no Cursor CLI binary.
+    await execFileAsync(process.execPath, [binPath, "HPL-ABCD-2345", "--agent", "cursor", "--origin", base], { env });
+    const addedId = "abliteration-abliterated-model-large-v2";
+    for (const args of [["add", addedId], ["add", addedId, "--harness", "all"]]) {
+      const { stdout } = await execFileAsync(process.execPath, [binPath, ...args], { env });
+      for (const agent of ["claude-code", "codex", "opencode", "copilot"]) {
+        assert.ok(stdout.includes(`available in ${agent}`), stdout);
+      }
+      assert.match(stdout, /Finish adding .* in cursor/);
+    }
+    fs.writeFileSync(path.join(fakeBin, "claude"), [
+      "#!/usr/bin/env node",
+      'const idx = process.argv.indexOf("--settings");',
+      "const settings = JSON.parse(process.argv[idx + 1]);",
+      "console.log(JSON.stringify(settings.modelPicker.options.map((row) => row.model)));",
+    ].join("\n"), { mode: 0o755 });
+    const run = await execFileAsync(process.execPath, [binPath, "run", "claude"], { env });
+    assert.equal(JSON.parse(run.stdout).filter((model) => model === addedId).length, 1);
     await execFileAsync(process.execPath, [binPath, "status"], { env });
     await execFileAsync(process.execPath, [binPath, "undo"], { env });
     assert.equal(
@@ -959,6 +982,42 @@ test("surgical previous-state restoration preserves post-install user edits acro
     assert.match(finalCodex, /\[mcp_servers\.post_install\]/);
   }));
 
+test("run passes native arguments verbatim after the harness and optional model", () => {
+  const model = "abliteration-abliterated-model-large-v2";
+  for (const [harness, native] of [
+    ["claude", ["--permission-mode", "bypassPermissions", "--resume", "session id", "--continue", "-p", ""]],
+    ["codex", ["exec", "--json", "--", "--literal"]],
+    ["opencode", ["run", "--agent", "build", "--model", "hallpass/example", "an argument with spaces"]],
+    ["copilot", ["--help", "--version", "-r", "session", "--", "-"]],
+  ]) {
+    const args = parseArgs(["run", harness, model, ...native]);
+    assert.equal(args.command, "run");
+    assert.equal(args.agent, normalizeAgentName(harness));
+    assert.equal(args.modelArg, model);
+    assert.deepEqual(args.passThroughArgs, native);
+  }
+  for (const native of [
+    ["-r", "thread", "--", "filename"], ["--agent", "reviewer"], ["--continue"], ["--model=haiku"],
+    ["--help"], ["--version"], ["--model", "sonnet", "-p", "--", "--literal"], ["a quoted prompt"],
+  ]) {
+    const args = parseArgs(["launch", "--harness=claude", ...native]);
+    assert.equal(args.command, "run");
+    assert.equal(args.modelArg, null);
+    assert.deepEqual(args.passThroughArgs, native);
+  }
+  assert.equal(parseArgs(["run", "--help"]).command, "help");
+  assert.deepEqual(parseArgs(["run", "codex", "--", "exec", "--", "file"]).passThroughArgs, ["exec", "--", "file"]);
+  const prefix = ["--origin", "https://example.test", "-r", "high"];
+  const native = ["-p", "--continue"];
+  const old = parseArgs(["run", "claude", model, ...prefix, "--", ...native]);
+  const direct = parseArgs(["run", ...prefix, "claude", model, ...native]);
+  assert.deepEqual(direct, old);
+  assert.equal(direct.reasoning, "high");
+  assert.equal(direct.origin, "https://example.test");
+  assert.deepEqual(direct.passThroughArgs, native);
+  assert.throws(() => parseArgs(["use", "--permission-mode", "manual"]), /Unknown option/);
+});
+
 test("interactive subscription guard, per-harness all-mode partial uninstall, agent aliases, and $0.00 status warning", async () => {
   assert.equal(normalizeAgentName("claude"), "claude-code");
   assert.equal(parseArgs(["run", "claude", "--", "-p", "Hi"]).agent, "claude-code");
@@ -1189,8 +1248,15 @@ test("auth browser OAuth callback verifies state, rejects bad state, claims code
 
     const configPath = path.join(dir, ".codex", "config.toml");
     const savedConfig = fs.readFileSync(configPath, "utf8");
-    assert.equal(await cliMain(["add", "deepseek-v4.1-flash", "--agent", "codex", "--origin", base]), 1);
-    assert.equal(fs.readFileSync(configPath, "utf8"), savedConfig);
+    // Upgrade a configuration created before explicit catalog discovery.
+    fs.writeFileSync(configPath, savedConfig.replace(/^model_catalog_url = .*\n/m, ""));
+    assert.equal(await cliMain(["add", "deepseek-v4.1-flash", "--agent", "codex", "--origin", base]), 0);
+    // The unqualified command must also find a machine with only Codex paired.
+    assert.equal(await cliMain(["add", "deepseek-v4.1-flash", "--origin", base]), 0);
+    const afterAdd = fs.readFileSync(configPath, "utf8");
+    assert.match(afterAdd, /model_catalog_url = "http:\/\/127\.0\.0\.1:\d+\/v1\/models"/);
+    const withoutCatalog = (config) => config.replace(/^model_catalog_url = .*\n/m, "");
+    assert.equal(withoutCatalog(afterAdd), withoutCatalog(savedConfig));
     assert.equal(await cliMain(["use", "deepseek-v4.1-flash", "--agent", "codex", "--origin", base]), 0);
     const codexToml = fs.readFileSync(path.join(dir, ".codex", "config.toml"), "utf8");
     assert.match(codexToml, /model = "deepseek-v4\.1-flash"/);
@@ -1348,6 +1414,54 @@ test("add without model opens filterable picker with top 5 popular models first,
   }
 });
 
+test("add registers every configured harness and run reuses added picker entries without switching defaults", () =>
+  withTempHome((home) => {
+    const id = "abliteration-abliterated-model-large-v2";
+    const model = { id, name: "Abliterated Large V2", protocols: ["messages", "responses", "chat/completions"] };
+    const models = [...SAMPLE_PAYLOAD.models, model];
+    const dir = path.join(home, ".config", "hallpass");
+    for (const mode of ["default", "coexist"]) {
+      configureAgent("claude-code", SAMPLE_PAYLOAD, { homeDir: home, mode });
+      const opts = { homeDir: home, catalogModels: models };
+      addModelToAgent("claude-code", id, opts);
+      addModelToAgent("claude-code", id, opts);
+      const launch = buildEphemeralLaunchSpec("claude-code", {
+        ...SAMPLE_PAYLOAD, homeDir: home, catalogModels: SAMPLE_PAYLOAD.models,
+      });
+      const picker = JSON.parse(launch.args[1]).modelPicker.options;
+      assert.deepEqual(picker.filter((row) => row.model === id).map((row) => row.label), ["Abliterated Large V2 (HallPass)"]);
+      assert.equal(launch.env.ANTHROPIC_MODEL, SAMPLE_PAYLOAD.model);
+      assert.equal(JSON.parse(launch.args[1]).env, undefined);
+
+      configureAgent("copilot", SAMPLE_PAYLOAD, { homeDir: home, mode });
+      addModelToAgent("copilot", id, opts);
+      addModelToAgent("copilot", id, opts);
+      const file = path.join(dir, "copilot-providers.json");
+      assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+      const registry = JSON.parse(fs.readFileSync(file, "utf8"));
+      assert.deepEqual(registry.models.map((row) => row.id), [SAMPLE_PAYLOAD.model, id]);
+      const copilot = buildEphemeralLaunchSpec("copilot", { ...SAMPLE_PAYLOAD, homeDir: home });
+      assert.equal(copilot.env.COPILOT_PROVIDERS_CONFIG, file);
+      assert.equal(copilot.env.COPILOT_MODEL, "hallpass/" + SAMPLE_PAYLOAD.model);
+      assert.match(fs.readFileSync(path.join(dir, "copilot.env"), "utf8"), /COPILOT_PROVIDERS_CONFIG=/);
+      const other = buildEphemeralLaunchSpec("copilot", { ...SAMPLE_PAYLOAD, homeDir: home,
+        model: "one-off", env: { COPILOT_PROVIDERS_CONFIG: file } });
+      assert.equal(other.env.COPILOT_PROVIDERS_CONFIG, undefined);
+      assert.equal(other.env.COPILOT_MODEL, "one-off");
+      for (const [extraArgs, wire] of [
+        [["--model=gpt-5.4"], "responses"],
+        [["--model", "hallpass-responses/gpt-5.4"], "responses"],
+        [["--", "--model=gpt-5.4"], "completions"],
+      ]) {
+        const run = buildEphemeralLaunchSpec("copilot", {...SAMPLE_PAYLOAD, catalogModels: models, extraArgs, homeDir: home});
+        assert.equal(run.env.COPILOT_PROVIDER_WIRE_API, wire);
+        assert.deepEqual(run.args, extraArgs);
+      }
+    }
+    undoAgent("copilot", { homeDir: home });
+    assert.equal(fs.existsSync(path.join(dir, "copilot-providers.json")), false);
+  }));
+
 test("CLI safety regressions: positional uninstall/pause agent, Codex pause->uninstall no duplicate TOML keys, coexist Claude settings untouched, stripJsonc strings", () =>
   withTempHome((home) => {
     // 1. parseArgs parses positional harness name for uninstall/pause/resume (never silently widens to 'all')
@@ -1390,4 +1504,25 @@ test("CLI safety regressions: positional uninstall/pause agent, Codex pause->uni
     const cursorPause = pauseAgent("cursor", { homeDir: home });
     assert.equal(cursorPause[0].manual, true);
     assert.equal(inspectAgentConfig("cursor", { homeDir: home }).paused, undefined);
+  }));
+
+test("Codex setup preserves web_search and restores the setting saved by older HallPass installs", () =>
+  withTempHome(home => {
+    const root = path.join(home, ".codex");
+    const toml = path.join(root, "config.toml");
+    const previousFile = path.join(home, ".config", "hallpass", "previous-state.json");
+    fs.mkdirSync(root, {recursive: true});
+    fs.writeFileSync(toml, 'web_search = "cached" # user\n');
+    configureAgent("codex", SAMPLE_PAYLOAD, {homeDir: home, mode: "default"});
+    assert.match(fs.readFileSync(toml, "utf8"), /web_search = "cached" # user/);
+    const previous = JSON.parse(fs.readFileSync(previousFile, "utf8"));
+    previous.codex.webSearchLine = 'web_search = "cached" # user';
+    fs.writeFileSync(previousFile, JSON.stringify(previous));
+    fs.writeFileSync(toml, fs.readFileSync(toml, "utf8").replace(previous.codex.webSearchLine, 'web_search = "disabled"'));
+    configureAgent("codex", SAMPLE_PAYLOAD, {homeDir: home, mode: "default"});
+    assert.match(fs.readFileSync(toml, "utf8"), /web_search = "cached" # user/);
+    assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(previousFile)).codex, "webSearchLine"), false);
+    fs.writeFileSync(toml, fs.readFileSync(toml, "utf8").replace(previous.codex.webSearchLine, 'web_search = "disabled"'));
+    undoAgent("codex", {homeDir: home});
+    assert.match(fs.readFileSync(toml, "utf8"), /web_search = "disabled"/);
   }));

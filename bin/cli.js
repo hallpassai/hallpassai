@@ -15,6 +15,7 @@ import {
   configureAgent,
   addModelToAgent,
   buildEphemeralLaunchSpec,
+  resolveRealBinary,
   prepareCodexSubscriptionResume,
   pauseAgent,
   resumeAgent,
@@ -46,6 +47,33 @@ import {
 
 const require = createRequire(import.meta.url);
 const pkg = require("../package.json");
+const nativeFlags = require("../src/native-flags.json");
+const nativeName = agent => agent === "claude-code" ? "claude" : agent;
+const nativeRootOptions = new Map(Object.entries(nativeFlags).map(([name, entry]) =>
+  [name, new Set(entry.commands[""].flatMap(decl => decl.match(/^--?[\w-]+(?:,?\s+--?[\w-]+)*/)[0].match(/--?[\w-]+/g)))]));
+
+function nativeCommandPath(agent, words) {
+  const name = nativeName(agent);
+  if (!Object.hasOwn(nativeFlags, name)) return false;
+  const inventory = nativeFlags[name];
+  let key = "";
+  for (const word of words) {
+    if (!/^[\w-]+$/.test(word)) return false;
+    key = key ? key + " " + word : word;
+    if (Object.hasOwn(inventory.aliases, key)) key = inventory.aliases[key];
+    if (!Object.hasOwn(inventory.commands, key) && !inventory.platforms?.[process.platform]?.[key]) return false;
+  }
+  return true;
+}
+
+function nativeDiscovery(agent, args) {
+  if (!Object.hasOwn(nativeFlags, nativeName(agent)) || !args.length) return false;
+  if (args.length === 1 && ["--version", agent === "codex" ? "-V" : "-v"].includes(args[0])) return true;
+  if (["-h", "--help"].includes(args.at(-1))) return nativeCommandPath(agent, args.slice(0, -1));
+  if (agent === "codex" && args[0] === "help") return nativeCommandPath(agent, args.slice(1));
+  if (agent === "copilot" && args[0] === "help" && args.length <= 2) return true;
+  return false;
+}
 
 const cleanLog = (s) => {
   const str = String(s ?? "");
@@ -115,7 +143,7 @@ ${bold("Usage:")}
   npx hallpassai add [MODEL-ID] [--harness <name>]
   npx hallpassai models [--provider <name>] [--search <query>]
   npx hallpassai use [MODEL-ID] [-r <level>] [--harness <name>]
-  npx hallpassai run [HARNESS] [MODEL-ID] [-- <tool-args...>]
+  npx hallpassai run [HARNESS] [MODEL-ID] [tool-args...]
   npx hallpassai pause | resume [--harness <name>]
   npx hallpassai pause codex --continue [--model <id>]
   npx hallpassai usage | status | doctor [--json]
@@ -136,7 +164,19 @@ ${bold("Options:")}
   --origin <url>         Override HallPass server origin
   -h, --help             Show help
   -v, --version          Show version
+
+For run, put HallPass options before the harness. Native commands and flags
+follow the harness and optional model. Use -- for an ambiguous positional.
 `);
+}
+
+function runHarness(agent, command, args, env = process.env) {
+  const launched = spawnSync(command, args, { stdio: "inherit", env });
+  if (launched.error) {
+    console.error(red(`Could not launch ${cleanLog(agent)}: ${cleanLog(launched.error.message)}`));
+    return 1;
+  }
+  return launched.status ?? 1;
 }
 
 function formatMicrosUsd(micros, { exact = false } = {}) {
@@ -159,8 +199,28 @@ function printQuickControls(agent, appliedModel) {
   if (agent === "cursor") return;
   const inToolSwitch =
     agent === "opencode" ? "`/models` (or `Ctrl+T` for reasoning)" : "`/model`";
-  const action = agent === "opencode" || agent === "claude-code" ? "add" : "use";
-  console.log(`  ${dim("in-session")} ${inToolSwitch} · \`npx hallpassai ${action} ${cleanLog(appliedModel || "deepseek-v4.1-flash")} --harness ${agent}\` · \`npx hallpassai pause ${agent}\``);
+  console.log(`  ${dim("in-session")} ${inToolSwitch} · \`npx hallpassai add ${cleanLog(appliedModel || "deepseek-v4.1-flash")} --harness ${agent}\` · \`npx hallpassai pause ${agent}\``);
+}
+
+// Older callers can put HallPass launch options between the harness and an explicit
+// separator. Match that whole prefix so a native flag's values and literal -- survive.
+const legacyRunOptions = new Set(["--origin", "--model", "-m", "--reasoning", "--effort", "-r"]);
+function isLegacyRunPrefix(argv, start, separator, hasModel) {
+  if (start >= separator) return false;
+  for (let i = start; i < separator; i++) {
+    const arg = argv[i];
+    const [flag] = arg.split("=", 1);
+    if (legacyRunOptions.has(flag)) {
+      const value = arg.includes("=") ? arg.slice(flag.length + 1) : argv[++i];
+      if (i >= separator || !value || value.startsWith("-")) return false;
+      if (["-r", "--reasoning", "--effort"].includes(flag) && !VALID_REASONING_LEVELS.has(value.toLowerCase())) return false;
+    } else if (!hasModel && isValidModelId(arg)) {
+      hasModel = true;
+    } else {
+      return false;
+    }
+  }
+  return true;
 }
 
 export function parseArgs(argv) {
@@ -182,11 +242,35 @@ export function parseArgs(argv) {
     origin: null,
     passThroughArgs: [],
   };
+  const separator = argv.indexOf("--");
+  let legacyEnd = -1;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--") {
       out.passThroughArgs = argv.slice(i + 1);
       break;
+    }
+    if (out.command === "run" && out.agent && i >= legacyEnd) {
+      if (out.agent === "cursor" || nativeCommandPath(out.agent, [a])) {
+        out.passThroughArgs = argv.slice(i);
+        break;
+      }
+      if (!out.modelArg && isValidModelId(a) && a !== "help" && a !== "version") {
+        out.modelArg = a;
+        continue;
+      }
+      // An unambiguous HallPass option identifies the older spelling. A native
+      // --model or -r followed by -- still belongs to the native command.
+      if (isLegacyRunPrefix(argv, i, separator, Boolean(out.modelArg)) &&
+          argv.slice(i, separator).some(word => {
+            const flag = word.split("=", 1)[0];
+            return legacyRunOptions.has(flag) && !nativeRootOptions.get(nativeName(out.agent))?.has(flag);
+          })) {
+        legacyEnd = separator;
+      } else {
+        out.passThroughArgs = argv.slice(i);
+        break;
+      }
     }
     if (a === "-h" || a === "--help" || a === "help") {
       out.command = "help";
@@ -327,6 +411,10 @@ export function parseArgs(argv) {
       continue;
     }
     if (a.startsWith("-")) {
+      if (out.command === "run") {
+        out.passThroughArgs = argv.slice(i);
+        break;
+      }
       throw new Error(`Unknown option: ${a}`);
     }
     if (!out.command) {
@@ -1412,6 +1500,7 @@ export async function main(
 
   const isModelCompatibleWithAgent = (agent, modelObj) => {
     if (!modelObj) return true;
+    if (agent === "copilot" && modelObj.protocols?.includes("responses")) return true;
     const reqProto =
       agent === "claude-code"
         ? "messages"
@@ -1432,17 +1521,11 @@ export async function main(
     if (!validateAgentFlag()) return 1;
     const creds = readStoredCredentials();
     const explicit = args.agent && args.agent !== "all";
-    if (explicit && !["claude-code", "opencode"].includes(args.agent)) {
-      console.error(args.agent === "cursor" ? "Add the model in Cursor Settings → Models." :
-        `Picker registration is unavailable for ${args.agent}. To change its default, run \`hallpassai use ${cleanLog(args.modelArg || "<model>")} --harness ${args.agent}\`.`);
-      return 1;
-    }
-    const targets = explicit ? [args.agent] :
-      Object.keys(creds.keys || {}).filter((agent) => ["claude-code", "opencode"].includes(agent));
+    const targets = explicit ? [args.agent] : SUPPORTED_AGENTS.filter((agent) => creds.keys?.[agent]);
     if (!targets.length) {
       console.error(
         red(
-          "Set up Claude Code or OpenCode to add a model to its picker.",
+          "Set up a tool first with `npx hallpassai setup <harness>`.",
         ),
       );
       return 1;
@@ -1522,31 +1605,47 @@ export async function main(
       return 1;
     }
     const addedTo = [];
+    let manual = false;
+    let failed = false;
+    let previewed = false;
     for (const agent of targets) {
       if (catalogMatch && !isModelCompatibleWithAgent(agent, catalogMatch)) {
-        if (targets.length === 1) {
-          console.error(
-            red(`Model "${cleanLog(chosenModelId)}" is not supported by ${cleanLog(agent)}.`),
-          );
-          return 1;
-        }
+        console.error(`Skipped ${agent}: its API does not support "${cleanLog(chosenModelId)}".`);
         continue;
       }
-      const res = addModelToAgent(agent, chosenModelId, { catalogModels });
-      addedTo.push(agent);
-      console.log(
-        `${green("✓")} Added ${bold(cleanLog(res.model))} to ${bold(cleanLog(agent))}`,
-      );
-      for (const f of res.files) console.log(`  ${dim("updated")} ${f}`);
-      if (res.hint) console.log(`  ${dim("tip")}     ${res.hint}`);
+      if (agent === "codex" && !catalogMatch) {
+        console.error("Codex discovers models from HallPass. Could not verify this model in the catalog. Retry when the gateway is reachable.");
+        failed = true;
+        continue;
+      }
+      if (args.dryRun) {
+        console.log(`Would add ${cleanLog(chosenModelId)} to ${agent}${agent === "cursor" ? " via Cursor Settings → Models" : ""}.`);
+        previewed = true;
+        continue;
+      }
+      try {
+        const res = addModelToAgent(agent, chosenModelId, { catalogModels });
+        if (res.manual) {
+          manual = true;
+          if (interactiveTty && !isRemoteOrHeadlessEnv()) {
+            if (args.launch !== false && !args.noBrowser) (openBrowser || openSystemBrowser)("cursor://anysphere.cursor-deeplink/settings");
+            if (copyToClipboard(chosenModelId)) console.log("Copied the model ID to your clipboard.");
+          }
+          console.log(`Finish adding ${bold(cleanLog(res.model))} in ${bold(agent)}.`);
+        } else {
+          addedTo.push(agent);
+          console.log(`${green("✓")} ${bold(cleanLog(res.model))} is available in ${bold(agent)}`);
+        }
+        for (const f of res.files) console.log(`  ${dim("updated")} ${f}`);
+        if (res.hint) console.log(`  ${dim("tip")}     ${res.hint}`);
+      } catch (err) {
+        failed = true;
+        console.error(red(`${agent}: ${cleanLog(err.message)}`));
+      }
     }
-    if (!addedTo.length) {
-      console.error(
-        red(`No configured tool on this machine supports "${cleanLog(chosenModelId)}".`),
-      );
-      return 1;
-    }
-    if (!telemetryDisabled()) {
+    if (previewed) return failed ? 1 : 0;
+    if (!addedTo.length && !manual) return 1;
+    if (addedTo.length && !telemetryDisabled()) {
       await sendCliEvent(
         "cli_model_added",
         {
@@ -1563,16 +1662,26 @@ export async function main(
         fetcher ? { fetcher } : undefined,
       );
     }
-    return 0;
+    return failed ? 1 : 0;
   }
 
   if (args.command === "run") {
     if (!validateAgentFlag()) return 1;
+    // Stock help and version are local operations, including before the first pairing.
+    if (nativeDiscovery(args.agent, args.passThroughArgs) || (args.agent === "cursor" && args.passThroughArgs.length)) {
+      const binary = nativeName(args.agent);
+      const status = runHarness(args.agent, resolveRealBinary(binary), args.passThroughArgs);
+      // OpenCode help ends without a newline. npm exec erases the current line
+      // when its terminal spinner closes, including the final option's text.
+      if (binary === "opencode" && ["-h", "--help"].includes(args.passThroughArgs.at(-1)) &&
+          process.stderr.isTTY && process.env.npm_command === "exec") process.stderr.write("\n");
+      return status;
+    }
     const creds = readStoredCredentials();
     if (args.agent === "cursor") {
       const cEntry = creds.keys?.cursor;
       console.log(
-        `${bold("Cursor")} is a desktop app and cannot be launched ephemerally from the terminal.`,
+        `${bold("Cursor")} uses the model configured in the desktop app. Run npx hallpassai run cursor --help for editor options.`,
       );
       if (cEntry) {
         console.log(`  Base URL: ${cleanLog(cEntry.apiBase)}`);
@@ -1587,11 +1696,10 @@ export async function main(
       (k) => k !== "cursor",
     );
     if (!configuredAgents.length) {
-      console.error(
-        red(
-          "No HallPass CLI credentials found. Pair first at https://app.hallpassai.com/start.html#connect",
-        ),
-      );
+      const authCommand = "npx hallpassai auth" + (args.agent && args.agent !== "all" ? " --harness " + args.agent : "");
+      console.error("Pair this terminal with HallPass to start a session.");
+      console.error("\n  " + authCommand);
+      console.error("\nOr open https://app.hallpassai.com/start.html#connect");
       return 1;
     }
     if (args.agent && args.agent !== "all" && !creds.keys[args.agent]) {
@@ -1649,15 +1757,7 @@ export async function main(
         fetcher ? { fetcher } : undefined,
       );
     }
-    const launched = spawnSync(spec.command, spec.args, {
-      stdio: "inherit",
-      env: spec.env,
-    });
-    if (launched.error) {
-      console.error(red(`Could not launch ${cleanLog(chosenAgent)}: ${cleanLog(launched.error.message)}`));
-      return 1;
-    }
-    return launched.status ?? 1;
+    return runHarness(chosenAgent, spec.command, spec.args, spec.env);
   }
 
   if (args.command === "models") {

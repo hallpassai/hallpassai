@@ -44,6 +44,22 @@ Run `npx hallpassai setup cursor` once. In **Cursor Settings → Models → API 
 
 Add the model ID to Cursor and select it in an Ask or Agent chat. Both `gpt-6.1-sol` and `deepseek-v4.1-flash` work with this flow. Run `npx hallpassai usage` to see the HallPass request. To return to your Cursor subscription, disable the OpenAI key and the base URL override, then select **Auto** in chat.
 
+`hallpassai add <model>` makes the model available in Claude Code, Codex, OpenCode, and Copilot CLI. In Cursor, finish by choosing **Add Custom Model** in **Settings → Models**. To start a Claude session directly on a model, run `npx hallpassai run claude <model>`.
+
+For `run` and its alias `launch`, put HallPass options before the tool name. Type native subcommands and flags just as you would after the native executable. For example, `npx hallpassai run codex exec --json "Review git diff"` and `npx hallpassai run opencode run --format json "Explain this change"`. Native help, short version flags, and subcommand help work before pairing. Try `npx hallpassai run codex exec --help`.
+
+A positional model can still follow the harness name. If it shares a name with a native subcommand, use `npx hallpassai run --model <id> <harness>`. Use `--` before a single-word prompt or project name that could be read as a model. A later `--` belonging to the native command is preserved. HallPass-specific launch options such as `--origin` belong before the harness.
+
+Copilot's native `--model` also selects the HallPass API protocol for that session. For example, `npx hallpassai run copilot --model deepseek-v4.1-flash -p "Summarize this diff"` uses Chat Completions even when the saved model uses Responses.
+
+`npx hallpassai run cursor` displays the desktop setup instructions. With arguments it calls the installed Cursor launcher, for example `npx hallpassai run cursor --version`. Editor settings control desktop model routing. `cursor agent` uses Cursor Agent's own authentication.
+
+The [versioned flag inventory](src/native-flags.json) lists command paths, aliases, and option spellings for each client. On a model qualified for hosted search, run `npx hallpassai run codex --search` to give Codex live web access. GPT-6.1 Sol supports live search. HallPass forwards domain filters to the supplier. With `--search`, the answer appears after the supplier finishes. A turn that uses search can record two metered requests, one for tool selection and one for the search-backed answer. The HallPass model catalog marks qualified models with `webSearch: true`. An explicit launch on an unqualified model reports that search is unavailable.
+
+To start Claude Code in Bypass Permissions mode, run `npx hallpassai run claude --dangerously-skip-permissions`. To make Bypass available through **Shift+Tab** and keep your starting mode, run `npx hallpassai run claude --allow-dangerously-skip-permissions`. Claude shows the same first-use warning for both flags. The footer after consent shows the active mode.
+
+If Claude Code reports that its auto-mode classifier gave no verdict for a write, use **Shift+Tab** at the idle prompt until you reach **Manual** and request the edit again. Claude will show the proposed file change for approval. To resume a specific conversation in that mode, run `npx hallpassai run claude <model> --resume <session-id> --permission-mode manual`. [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes)
+
 ## Commands
 
 ```bash
@@ -51,8 +67,9 @@ Add the model ID to Cursor and select it in an Ask or Agent chat. Both `gpt-6.1-
 npx hallpassai auth
 npx hallpassai auth HP-XXXX-XXXX
 
-# Register a model in the Claude Code or OpenCode picker
+# Add a model to compatible, configured tools. The current default stays selected.
 npx hallpassai add
+npx hallpassai add abliteration-abliterated-model-large-v2
 npx hallpassai add deepseek-v4.1-flash --harness opencode
 npx hallpassai add claude-opus-5.5 --harness claude-code
 
@@ -63,7 +80,8 @@ npx hallpassai use   # interactive model picker
 
 # Run a single session in memory without editing dotfiles
 npx hallpassai run claude claude-opus-5.5
-npx hallpassai run codex gpt-6.1-sol -- exec "Review git diff"
+npx hallpassai run claude --resume <session-id> --permission-mode manual
+npx hallpassai run codex gpt-6.1-sol exec "Review git diff"
 
 # Pause default routing (restores native logins) and resume anytime
 npx hallpassai pause

@@ -237,6 +237,10 @@ export function detectExistingSubscription(agent, homeDir = os.homedir()) {
   return { detected: false, label: "" };
 }
 
+// Claude dispatches these session commands before its regular option parser.
+// A preceding --settings turns e.g. "logs ID" into an interactive prompt.
+const claudeSessionCommands = ["attach", "logs", "respawn", "rm", "stop", "kill"];
+
 export function resolveRealBinary(cmd, env = process.env, homeDir = os.homedir()) {
   const shimDir = path.resolve(path.join(hallpassDir(homeDir), "bin"));
   const pathSep = process.platform === "win32" ? ";" : ":";
@@ -268,6 +272,10 @@ export function resolveRealBinary(cmd, env = process.env, homeDir = os.homedir()
       }
     });
     if (nonWallet) return nonWallet;
+  }
+  if (!candidates.length && cmd === "cursor" && process.platform === "darwin") {
+    const editor = "/Applications/Cursor.app/Contents/Resources/app/bin/cursor";
+    if (fs.existsSync(editor)) return editor;
   }
   return candidates[0] || cmd;
 }
@@ -337,6 +345,25 @@ function supportsReasoningId(id = "") {
   );
 }
 
+// Older default installations replaced the user's root search setting and saved its original line.
+function restoreLegacyCodexSearch(toml, previous) {
+  if (!previous || !Object.hasOwn(previous, "webSearchLine")) return toml;
+  const lines = toml.split("\n");
+  const section = lines.findIndex(line => TOML_HEADER_RE.test(line));
+  const root = lines.slice(0, section === -1 ? lines.length : section);
+  if (!root.some(line => /^\s*model_provider\s*=\s*"hallpass"\s*(?:#.*)?$/.test(line))) return toml;
+  const index = root.indexOf('web_search = "disabled"');
+  if (index !== -1) lines.splice(index, 1, ...(previous.webSearchLine ? [previous.webSearchLine] : []));
+  return lines.join("\n");
+}
+
+function retireLegacyCodexSearch(homeDir) {
+  const state = readPreviousState(homeDir);
+  if (!state.codex || !Object.hasOwn(state.codex, "webSearchLine")) return;
+  delete state.codex.webSearchLine;
+  writePrivateFile(previousStatePath(homeDir), JSON.stringify(state, null, 2) + "\n", 0o600);
+}
+
 function stripHallpassFromCodexToml(existingToml, { removeTopLevelProvider = false } = {}) {
   const lines = existingToml
     ? existingToml.replace(/\r\n/g, "\n").split("\n")
@@ -371,8 +398,7 @@ function stripHallpassFromCodexToml(existingToml, { removeTopLevelProvider = fal
         i < limit &&
         (/^\s*model_provider\s*=\s*"hallpass"\s*(?:#.*)?$/.test(kept[i]) ||
           (hadHallpassProvider && /^\s*model\s*=/.test(kept[i])) ||
-          (hadHallpassProvider && /^\s*model_reasoning_effort\s*=/.test(kept[i])) ||
-          (hadHallpassProvider && /^\s*web_search\s*=\s*"disabled"\s*(?:#.*)?$/.test(kept[i])))
+          (hadHallpassProvider && /^\s*model_reasoning_effort\s*=/.test(kept[i])))
       ) {
         continue;
       }
@@ -383,6 +409,10 @@ function stripHallpassFromCodexToml(existingToml, { removeTopLevelProvider = fal
     return filtered.length ? filtered.join("\n") + "\n" : "";
   }
   return kept;
+}
+
+function codexCatalogSetting(apiBase) {
+  return `model_catalog_url = ${tomlBasicString(apiBase.replace(/\/$/, "") + "/models")}`;
 }
 
 export function upsertCodexToml(
@@ -411,7 +441,6 @@ export function upsertCodexToml(
     let limit = firstSectionIdx === -1 ? kept.length : firstSectionIdx;
     let sawModel = false;
     let sawProvider = false;
-    let sawWebSearch = false;
     let sawReasoning = false;
     for (let i = 0; i < limit; i++) {
       if (/^\s*model\s*=/.test(kept[i])) {
@@ -420,9 +449,6 @@ export function upsertCodexToml(
       } else if (/^\s*model_provider\s*=/.test(kept[i])) {
         kept[i] = `model_provider = "hallpass"`;
         sawProvider = true;
-      } else if (/^\s*web_search\s*=/.test(kept[i])) {
-        kept[i] = `web_search = "disabled"`;
-        sawWebSearch = true;
       } else if (/^\s*model_reasoning_effort\s*=/.test(kept[i])) {
         if (codexEff) {
           kept[i] = `model_reasoning_effort = ${tomlBasicString(codexEff)}`;
@@ -440,7 +466,6 @@ export function upsertCodexToml(
     if (codexEff && !sawReasoning) {
       topInserts.push(`model_reasoning_effort = ${tomlBasicString(codexEff)}`);
     }
-    if (!sawWebSearch) topInserts.push(`web_search = "disabled"`);
     if (topInserts.length) {
       kept.splice(
         0,
@@ -457,6 +482,7 @@ export function upsertCodexToml(
     "[model_providers.hallpass]",
     `name = "HallPass"`,
     `base_url = ${tomlBasicString(apiBase)}`,
+    codexCatalogSetting(apiBase),
     `wire_api = "responses"`,
     `supports_websockets = false`,
     `requires_openai_auth = false`,
@@ -483,7 +509,6 @@ function buildCodexProfileToml({ model, reasoningEffort = null }) {
       `model_provider = "hallpass"`,
       `model = ${tomlBasicString(model)}`,
       ...(codexEff ? [`model_reasoning_effort = ${tomlBasicString(codexEff)}`] : []),
-      `web_search = "disabled"`,
     ].join("\n") + "\n"
   );
 }
@@ -781,6 +806,8 @@ export function configureAgent(
         writePrivateFile(sideSettingsPath, content, 0o600);
         const realClaude = resolveRealBinary("claude", process.env, homeDir);
         const shimPath = writeShimScript(homeDir, "claude-hp", [
+          `case "\${1:-}" in ${claudeSessionCommands.join("|")}) exec ${shSingleQuote(realClaude)} "$@" ;; esac`,
+          `case "\${1:-}:\${2:-}" in --bg:--exec|--background:--exec) exec ${shSingleQuote(realClaude)} "$@" ;; esac`,
           `exec ${shSingleQuote(realClaude)} --settings ${shSingleQuote(sideSettingsPath)} "$@"`,
         ]);
         return {
@@ -899,7 +926,7 @@ export function configureAgent(
     const configPath = path.join(codexDir, "config.toml");
     assertNotSymlink(configPath);
     const existing = fs.existsSync(configPath)
-      ? fs.readFileSync(configPath, "utf8")
+      ? restoreLegacyCodexSearch(fs.readFileSync(configPath, "utf8"), readPreviousState(homeDir).codex)
       : "";
     const helperPath = helperScriptPath(homeDir);
     const openAiResponses = models.filter(
@@ -949,6 +976,7 @@ export function configureAgent(
         );
         writePrivateFile(configPath, content, 0o600);
         writePrivateFile(profilePath, profileContent, 0o600);
+        retireLegacyCodexSearch(homeDir);
         const realCodex = resolveRealBinary("codex", process.env, homeDir);
         const shimPath = writeShimScript(homeDir, "codex-hp", [
           `exec ${shSingleQuote(realCodex)} -p hallpass "$@"`,
@@ -999,7 +1027,6 @@ export function configureAgent(
             modelLine: findRoot(/^\s*model\s*=/),
             providerLine: findRoot(/^\s*model_provider\s*=/),
             reasoningLine: findRoot(/^\s*model_reasoning_effort\s*=/),
-            webSearchLine: findRoot(/^\s*web_search\s*=/),
           },
           homeDir,
         );
@@ -1016,6 +1043,7 @@ export function configureAgent(
         ? backupOnce(configPath, { secret: true })
         : null;
       writePrivateFile(configPath, content, 0o600);
+      retireLegacyCodexSearch(homeDir);
       return {
         agent,
         mode: "default",
@@ -1210,11 +1238,7 @@ export function configureAgent(
       models.find((m) => m.protocols?.includes("responses")) ||
       null;
     const chosenModel = chosenObj?.id || model;
-    const useResponsesWire = Boolean(
-      chosenObj?.protocols?.includes("responses") &&
-        (chosenObj?.provider === "OpenAI" ||
-          /^(?:gpt-[56]|o[134]|codex)/i.test(chosenModel)),
-    );
+    const useResponsesWire = copilotResponses(chosenObj);
     const copilotMaxOut = String(
       Number.isInteger(chosenObj?.maxOutputTokens) &&
         chosenObj.maxOutputTokens > 0
@@ -1222,7 +1246,7 @@ export function configureAgent(
         : 8192,
     );
     const { rcPath, isFish } = resolveShellRcTarget(homeDir, shell);
-    const envContent = [
+    let envContent = [
       `# HallPass configuration for GitHub Copilot CLI`,
       `export COPILOT_OFFLINE='true'`,
       `export COPILOT_PROVIDER_TYPE='openai'`,
@@ -1236,7 +1260,7 @@ export function configureAgent(
       "",
     ].join("\n");
     const fishEnvPath = path.join(dir, "copilot.fish");
-    const fishEnvContent = [
+    let fishEnvContent = [
       `# HallPass configuration for GitHub Copilot CLI (fish)`,
       `set -gx COPILOT_OFFLINE 'true'`,
       `set -gx COPILOT_PROVIDER_TYPE 'openai'`,
@@ -1249,6 +1273,14 @@ export function configureAgent(
       `set -gx COPILOT_PROVIDER_HEADERS 'X-Client-Name: copilot'`,
       "",
     ].join("\n");
+
+    const catalogFile = copilotCatalogPath(homeDir);
+    if (!dryRun && fs.existsSync(catalogFile)) {
+      const rows = updateCopilotCatalog(catalogFile, { token, apiBase }, [chosenObj || { id: chosenModel }]);
+      const selected = rows.find((m) => m.id === chosenModel);
+      envContent = copilotPickerEnv(envContent, catalogFile, selected, false);
+      fishEnvContent = copilotPickerEnv(fishEnvContent, catalogFile, selected, true);
+    }
 
     if (effectiveMode === "coexist") {
       if (!dryRun) {
@@ -1375,6 +1407,68 @@ export function configureAgent(
   throw new Error(`Unsupported agent: ${agent}`);
 }
 
+function claudePickerSettingsPath(entry, homeDir) {
+  return entry?.mode === "coexist"
+    ? path.join(hallpassDir(homeDir), "claude-settings.json")
+    : path.join(homeDir, ".claude", "settings.json");
+}
+
+function copilotResponses(model) {
+  const protocols = model?.protocols || [];
+  if (protocols.length && !protocols.includes("responses")) return false;
+  if (protocols.length && !protocols.includes("chat/completions")) return true;
+  return model?.provider === "OpenAI" || /^(?:gpt-[56]|o[134]|codex)/i.test(model?.id || "");
+}
+
+function copilotCatalogPath(homeDir) {
+  return path.join(hallpassDir(homeDir), "copilot-providers.json");
+}
+
+// Copilot gives an explicitly selected providers file precedence over legacy BYOK env vars.
+// Scope it to HallPass sessions so a coexist install keeps its native GitHub login.
+function updateCopilotCatalog(file, entry, models) {
+  const catalog = readJsonSafe(file);
+  catalog.models ||= [];
+  const hallpassProviders = ["hallpass", "hallpass-responses"];
+  const saved = catalog.models.filter((m) => hallpassProviders.includes(m.provider));
+  for (const model of models) {
+    const existing = saved.find((m) => m.id === model.id);
+    const row = existing || { id: model.id };
+    if (!existing || model.protocols?.length) {
+      row.provider = copilotResponses(model) ? "hallpass-responses" : "hallpass";
+    }
+    row.name = model.name || row.name || model.id;
+    if (model.contextLength) row.maxContextWindowTokens = model.contextLength;
+    if (model.maxOutputTokens) row.maxOutputTokens = model.maxOutputTokens;
+    row.capabilities ||= { supports: { vision: true } };
+    if (!existing) {
+      catalog.models.push(row);
+      saved.push(row);
+    }
+  }
+  catalog.providers = (catalog.providers || []).filter((p) => !hallpassProviders.includes(p.name));
+  for (const name of new Set(saved.map((m) => m.provider))) {
+    catalog.providers.push({
+      name, type: "openai", baseUrl: entry.apiBase, apiKey: entry.token,
+      wireApi: name === "hallpass-responses" ? "responses" : "completions",
+      headers: { "X-Client-Name": "copilot" },
+    });
+  }
+  writePrivateFile(file, JSON.stringify(catalog, null, 2) + "\n", 0o600);
+  return saved;
+}
+
+function copilotPickerEnv(content, file, model, fish) {
+  const quote = fish ? fishSingleQuote : shSingleQuote;
+  const prefix = fish ? "set -gx " : "export ";
+  const sep = fish ? " " : "=";
+  const lines = content.trimEnd().split("\n").filter((line) =>
+    !line.startsWith(prefix + "COPILOT_PROVIDERS_CONFIG" + sep) &&
+    !line.startsWith(prefix + "COPILOT_MODEL" + sep));
+  return [...lines, prefix + "COPILOT_PROVIDERS_CONFIG" + sep + quote(file),
+    prefix + "COPILOT_MODEL" + sep + quote(model.provider + "/" + model.id), ""].join("\n");
+}
+
 export function addModelToAgent(
   agent,
   modelId,
@@ -1395,16 +1489,12 @@ export function addModelToAgent(
     reasoning: supportsReasoningId(modelId),
   };
 
+  if (entry.paused) {
+    throw new Error(`${agent} is paused. Run \`npx hallpassai resume ${agent}\` first.`);
+  }
+
   if (agent === "claude-code") {
-    if (entry.paused) {
-      throw new Error(
-        "claude-code is currently paused. Run `npx hallpassai resume claude-code` first.",
-      );
-    }
-    const targetPath =
-      entry.mode === "coexist"
-        ? path.join(hallpassDir(homeDir), "claude-settings.json")
-        : path.join(homeDir, ".claude", "settings.json");
+    const targetPath = claudePickerSettingsPath(entry, homeDir);
     const cur = readJsonSafe(targetPath);
     const existingOpts = Array.isArray(cur.modelPicker?.options)
       ? cur.modelPicker.options.filter((o) => o?.model !== modelId)
@@ -1426,7 +1516,10 @@ export function addModelToAgent(
       options: nextOpts,
     };
     writePrivateFile(targetPath, JSON.stringify(cur, null, 2) + "\n", 0o600);
-    return { agent, model: modelId, files: [targetPath], hint: "Pick it anytime via `/model` in Claude Code." };
+    return {
+      agent, model: modelId, files: [targetPath],
+      hint: `Choose ${mObj.name || modelId} (HallPass) in /model.\n          To start a new session with this model, run\n          npx hallpassai run claude ${modelId}`,
+    };
   }
 
   if (agent === "opencode") {
@@ -1450,9 +1543,48 @@ export function addModelToAgent(
     return { agent, model: modelId, files: [cfgPath], hint: `Run \`opencode -m hallpass/${modelId}\` or select in \`/models\`.` };
   }
 
-  if (agent === "cursor") throw new Error(`Add "${modelId}" in Cursor Settings → Models.`);
-  if (agent === "codex" || agent === "copilot") {
-    throw new Error(`Picker registration is unavailable for ${agent}. To change its default, run \`hallpassai use ${modelId} --harness ${agent}\`.`);
+  if (agent === "codex") {
+    const file = path.join(resolveCodexDir(homeDir), "config.toml");
+    assertNotSymlink(file);
+    const raw = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+    const lines = raw.split(/\r?\n/);
+    const start = lines.findIndex((line) => line.match(TOML_HEADER_RE)?.[2].trim() === "model_providers.hallpass");
+    if (start < 0) throw new Error("Run `npx hallpassai setup codex` to restore the HallPass provider.");
+    let end = start + 1;
+    while (end < lines.length && !TOML_HEADER_RE.test(lines[end])) end++;
+    const setting = codexCatalogSetting(entry.apiBase);
+    const idx = lines.slice(start + 1, end).findIndex((line) => /^\s*model_catalog_url\s*=/.test(line));
+    const files = [];
+    if (idx < 0 || lines[start + 1 + idx] !== setting) {
+      if (idx < 0) lines.splice(start + 1, 0, setting);
+      else lines[start + 1 + idx] = setting;
+      writePrivateFile(file, lines.join(raw.includes("\r\n") ? "\r\n" : "\n"), 0o600);
+      files.push(file);
+    }
+    const launch = entry.mode === "coexist" ? "codex -p hallpass" : "codex";
+    return { agent, model: modelId, files, hint: `Start \`${launch}\` and choose the model in \`/model\`.` };
+  }
+
+  if (agent === "copilot") {
+    const file = copilotCatalogPath(homeDir);
+    const envFiles = ["copilot.env", "copilot.fish"].map((name) => path.join(hallpassDir(homeDir), name))
+      .filter((name) => fs.existsSync(name));
+    if (!envFiles.length) throw new Error("Run `npx hallpassai setup copilot` to restore the HallPass configuration.");
+    const current = catalogModels.find((m) => m.id === entry.model) || { id: entry.model };
+    const models = updateCopilotCatalog(file, entry, [current, mObj]);
+    const selected = models.find((m) => m.id === entry.model);
+    for (const envFile of envFiles) {
+      assertNotSymlink(envFile);
+      const raw = fs.readFileSync(envFile, "utf8");
+      writePrivateFile(envFile, copilotPickerEnv(raw, file, selected, envFile.endsWith(".fish")), 0o600);
+    }
+    return { agent, model: modelId, files: [file, ...envFiles],
+      hint: "Start `npx hallpassai run copilot` and choose the model in `/model`." };
+  }
+
+  if (agent === "cursor") {
+    return { agent, model: modelId, files: [], manual: true,
+      hint: `In Cursor Settings → Models, choose Add Custom Model, enter ${modelId}, and press Enter.` };
   }
   throw new Error(`Unsupported agent: ${agent}`);
 }
@@ -1492,16 +1624,21 @@ export function buildEphemeralLaunchSpec(
             : null;
     const claudeEffort =
       mappedEffort && supportsReasoningId(model) ? mappedEffort : null;
+    const entry = readStoredCredentials(homeDir).keys?.["claude-code"];
+    const picker = entry ? readJsonSafe(claudePickerSettingsPath(entry, homeDir)).modelPicker : null;
     const inlineSettings = {
       ...(claudeEffort ? { effortLevel: claudeEffort } : {}),
       modelPicker: {
-        replaceBuiltInOptions: false,
-        options: buildClaudeModelPickerOptions(model, catalogModels),
+        replaceBuiltInOptions: Boolean(picker?.replaceBuiltInOptions),
+        options: buildClaudeModelPickerOptions(model, catalogModels, picker?.options || []),
       },
     };
     return {
       command: claudeBin,
-      args: ["--settings", JSON.stringify(inlineSettings), ...extraArgs],
+      args: claudeSessionCommands.includes(extraArgs[0]) ||
+        (["--bg", "--background"].includes(extraArgs[0]) && extraArgs[1] === "--exec")
+        ? [...extraArgs]
+        : ["--settings", JSON.stringify(inlineSettings), ...extraArgs],
       env: {
         ...cleanEnv,
         ANTHROPIC_BASE_URL: anthropicBase,
@@ -1528,7 +1665,12 @@ export function buildEphemeralLaunchSpec(
     const auth = hasAuthCommand
       ? `auth={command=${tomlBasicString(process.execPath)},args=["-e", "process.stdout.write(process.env.HALLPASS_API_KEY || '')"],timeout_ms=6000}`
       : 'env_key="HALLPASS_API_KEY"';
-    const providerInline = `model_providers.hallpass={name="HallPass",base_url=${tomlBasicString(apiBase)},wire_api="responses",supports_websockets=false,requires_openai_auth=false,${auth}}`;
+    // Codex also sends live search implicitly in full-access mode. Mark an explicit user request
+    // so an unavailable model can report it while ordinary Codex sessions still run.
+    const separator = extraArgs.indexOf("--");
+    const requireSearch = (separator < 0 ? extraArgs : extraArgs.slice(0, separator)).includes("--search");
+    const searchHeader = requireSearch ? ',http_headers={"X-HallPass-Require-Web-Search"="1"}' : "";
+    const providerInline = `model_providers.hallpass={name="HallPass",base_url=${tomlBasicString(apiBase)},${codexCatalogSetting(apiBase)},wire_api="responses",supports_websockets=false,requires_openai_auth=false,${auth}${searchHeader}}`;
     const isGpt6 = /^gpt-6/i.test(model);
     const rawEff =
       reasoning === "none"
@@ -1550,8 +1692,7 @@ export function buildEphemeralLaunchSpec(
         'model_provider="hallpass"',
         "-c",
         `model=${tomlBasicString(model)}`,
-        "-c",
-        'web_search="disabled"',
+        ...(requireSearch ? ["-c", 'web_search="live"'] : []),
         ...(eff ? ["-c", `model_reasoning_effort=${tomlBasicString(eff)}`] : []),
         ...extraArgs,
       ],
@@ -1617,11 +1758,24 @@ export function buildEphemeralLaunchSpec(
 
   if (agent === "copilot") {
     const cpBin = resolveRealBinary("copilot", cleanEnv, homeDir);
-    const mObj = catalogModels.find((m) => m.id === model);
-    const useResponsesWire = Boolean(
-      mObj?.protocols?.includes("responses") &&
-        (mObj?.provider === "OpenAI" || /^(?:gpt-[56]|o[134]|codex)/i.test(model)),
-    );
+    // Copilot selects the CLI model itself, but its BYOK transport is fixed by
+    // the environment before launch. Match the transport to a native override.
+    let requested;
+    for (let i = 0; i < extraArgs.length && extraArgs[i] !== "--"; i++) {
+      if (extraArgs[i] === "--model") {
+        if (extraArgs[i + 1] === "--") break;
+        requested = extraArgs[++i];
+      } else if (extraArgs[i].startsWith("--model=")) requested = extraArgs[i].slice("--model=".length);
+    }
+    const requestedId = requested?.replace(/^hallpass(?:-responses)?\//, "");
+    const file = copilotCatalogPath(homeDir);
+    const saved = readJsonSafe(file).models?.filter(m => ["hallpass", "hallpass-responses"].includes(m.provider)) || [];
+    const selectedModel = requestedId && requestedId !== "auto" ? requestedId : model;
+    const selected = saved.find(m => m.id === selectedModel);
+    const useResponsesWire = selected ? selected.provider === "hallpass-responses" :
+      copilotResponses(catalogModels.find(m => m.id === selectedModel) || {id: selectedModel});
+    // An explicit one-off model can still use legacy BYOK when it isn't in the saved picker.
+    if (cleanEnv.COPILOT_PROVIDERS_CONFIG === file) delete cleanEnv.COPILOT_PROVIDERS_CONFIG;
     return {
       command: cpBin,
       args: [...extraArgs],
@@ -1632,7 +1786,8 @@ export function buildEphemeralLaunchSpec(
         COPILOT_PROVIDER_WIRE_API: useResponsesWire ? "responses" : "completions",
         COPILOT_PROVIDER_BASE_URL: apiBase,
         COPILOT_PROVIDER_API_KEY: token,
-        COPILOT_MODEL: model,
+        ...(selected ? { COPILOT_PROVIDERS_CONFIG: file } : {}),
+        COPILOT_MODEL: selected ? `${selected.provider}/${selectedModel}` : selectedModel,
         COPILOT_PROVIDER_MAX_OUTPUT_TOKENS: "16384",
         COPILOT_PROVIDER_VISION: "true",
         COPILOT_PROVIDER_HEADERS: "X-Client-Name: copilot",
@@ -1821,7 +1976,7 @@ function surgicallyRestoreGlobalConfig(
     const fp = path.join(codexDir, "config.toml");
     if (fs.existsSync(fp) || codexSubscription) {
       assertNotSymlink(fp);
-      const raw = fs.existsSync(fp) ? fs.readFileSync(fp, "utf8") : "";
+      const raw = fs.existsSync(fp) ? restoreLegacyCodexSearch(fs.readFileSync(fp, "utf8"), prev) : "";
       if (keepAdditive) {
         const strippedRoot = stripHallpassFromCodexToml(raw, {
           removeTopLevelProvider: true,
@@ -1831,7 +1986,6 @@ function surgicallyRestoreGlobalConfig(
           prev?.modelLine,
           prev?.providerLine,
           prev?.reasoningLine,
-          prev?.webSearchLine,
         ].filter(Boolean);
         const baseToml = mergeCodexRestoredRootLines(restoredRootLines, strippedRoot).trim();
         const hallpassProvider = {
@@ -1874,7 +2028,6 @@ function surgicallyRestoreGlobalConfig(
           prev?.modelLine,
           prev?.providerLine,
           prev?.reasoningLine,
-          prev?.webSearchLine,
         ].filter(Boolean);
         const merged = mergeCodexRestoredRootLines(restoredRootLines, cleaned);
         unlinkBak(fp);
@@ -1884,6 +2037,7 @@ function surgicallyRestoreGlobalConfig(
           writePrivateFile(fp, merged, 0o600);
         }
       }
+      if (keepAdditive) retireLegacyCodexSearch(homeDir);
       touched.push(fp);
     }
     if (!keepAdditive) {
@@ -1945,7 +2099,7 @@ function surgicallyRestoreGlobalConfig(
     const envPath = path.join(hallpassDir(homeDir), "copilot.env");
     const fishEnvPath = path.join(hallpassDir(homeDir), "copilot.fish");
     if (!keepAdditive) {
-      for (const p of [envPath, fishEnvPath]) {
+      for (const p of [envPath, fishEnvPath, copilotCatalogPath(homeDir)]) {
         if (fs.existsSync(p)) {
           assertNotSymlink(p);
           fs.unlinkSync(p);
@@ -2285,13 +2439,14 @@ export function inspectAgentConfig(
       const envPath = path.join(hallpassDir(homeDir), "copilot.env");
       const envRaw = fs.existsSync(envPath) ? fs.readFileSync(envPath, "utf8") : "";
       const mMatch = envRaw.match(/COPILOT_MODEL='([^']+)'/);
+      const diskModel = mMatch?.[1]?.replace(/^hallpass(?:-responses)?\//, "") || null;
       if (saved?.mode === "coexist") {
         const shim = path.join(hallpassDir(homeDir), "bin", "copilot-hp");
         const ok = fs.existsSync(envPath) && fs.existsSync(shim);
         return {
           ok,
           configPath: envPath,
-          diskModel: mMatch ? mMatch[1] : null,
+          diskModel,
           diskReasoning: null,
           note: ok
             ? "coexist mode (`copilot-hp` / `npx hallpassai run copilot`)"
@@ -2304,7 +2459,7 @@ export function inspectAgentConfig(
       return {
         ok,
         configPath: envPath,
-        diskModel: mMatch ? mMatch[1] : null,
+        diskModel,
         diskReasoning: null,
         note: ok
           ? `copilot.env + ${path.basename(rcPath)} profile block active`
