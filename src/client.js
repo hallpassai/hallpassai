@@ -5,6 +5,7 @@ const VALID_HARNESSES = new Set([
   "opencode",
   "copilot",
   "cursor",
+  "cline",
   "all",
 ]);
 

@@ -195,11 +195,11 @@ function formatCompactTokens(val) {
   return n.toLocaleString("en-US");
 }
 
-function printQuickControls(agent, appliedModel) {
+function printQuickControls(agent, _appliedModel) {
   if (agent === "cursor") return;
   const inToolSwitch =
     agent === "opencode" ? "`/models` (or `Ctrl+T` for reasoning)" : "`/model`";
-  console.log(`  ${dim("in-session")} ${inToolSwitch} · \`npx hallpassai add ${cleanLog(appliedModel || "deepseek-v4.1-flash")} --harness ${agent}\` · \`npx hallpassai pause ${agent}\``);
+  console.log(`  ${dim("in-session")} ${inToolSwitch} · \`npx hallpassai add --harness ${agent}\` (interactive picker) · \`npx hallpassai pause ${agent}\``);
 }
 
 // Older callers can put HallPass launch options between the harness and an explicit
@@ -801,6 +801,7 @@ export async function pickModelInteractive(
   models,
   {
     title = "Select a model to add",
+    initialQuery = "",
     input = process.stdin,
     output = process.stdout,
     windowSize = 10,
@@ -861,7 +862,7 @@ export async function pickModelInteractive(
   }
 
   return new Promise((resolve) => {
-    let query = "";
+    let query = String(initialQuery || "");
     let index = 0;
     let renderedLines = 0;
     const prevRaw = Boolean(input.isRaw);
@@ -997,13 +998,14 @@ export async function pickModelInteractive(
   });
 }
 
-const toolNames = { "claude-code": "Claude Code", codex: "Codex", opencode: "OpenCode", copilot: "Copilot CLI", cursor: "Cursor" };
+const toolNames = { "claude-code": "Claude Code", codex: "Codex", opencode: "OpenCode", copilot: "Copilot CLI", cursor: "Cursor", cline: "Cline" };
 const nativeCommand = (agent) => agent === "claude-code" ? "claude" : agent;
 const coexistHint = {
   "claude-code": "Use the separate Claude launcher printed after setup for HallPass.",
   codex: "Use `codex -p hallpass` for HallPass.",
   opencode: "Choose a HallPass model from `/models` in OpenCode.",
   copilot: "Use the separate Copilot launcher printed after setup for HallPass.",
+  cline: "Use `npx hallpassai run cline` for isolated HallPass sessions.",
 };
 
 async function chooseSetupOption(question, options, preferred, { input, output }) {
@@ -1593,16 +1595,38 @@ export async function main(
       return 1;
     }
 
-    const catalogMatch = catalogModels.length
+    let catalogMatch = catalogModels.length
       ? catalogModels.find((m) => m.id === chosenModelId)
       : null;
     if (catalogModels.length && !catalogMatch) {
-      console.error(
-        red(
-          `Unknown model "${cleanLog(chosenModelId)}". Run \`npx hallpassai add\` to browse interactively or \`npx hallpassai models\`.`,
-        ),
+      const compatiblePool = catalogModels.filter((m) =>
+        targets.some((agent) => isModelCompatibleWithAgent(agent, m)),
       );
-      return 1;
+      const fuzzy = filterModelsByQuery(compatiblePool, chosenModelId);
+      if (fuzzy.length === 1) {
+        chosenModelId = fuzzy[0].id;
+        catalogMatch = fuzzy[0];
+      } else if (interactiveTty && compatiblePool.length) {
+        const picked = await pickModelInteractive(compatiblePool, {
+          title: `Add a model to ${targets.join(", ")}`,
+          initialQuery: chosenModelId,
+          input,
+          output,
+        });
+        if (!picked) {
+          console.log(dim("Cancelled."));
+          return 0;
+        }
+        chosenModelId = picked;
+        catalogMatch = catalogModels.find((m) => m.id === chosenModelId) || null;
+      } else {
+        console.error(
+          red(
+            `Unknown model "${cleanLog(chosenModelId)}". Run \`npx hallpassai add\` to search interactively or \`npx hallpassai models\`.`,
+          ),
+        );
+        return 1;
+      }
     }
     const addedTo = [];
     let manual = false;
@@ -1957,21 +1981,40 @@ export async function main(
       return 1;
     }
 
-    const catalogMatch =
+    let catalogMatch =
       chosenModel && catalogModels.length
         ? catalogModels.find((m) => m.id === chosenModel)
         : null;
     if (chosenModel && catalogModels.length && !catalogMatch) {
-      const suggestions = catalogModels
-        .filter((m) => m.id.includes(chosenModel.toLowerCase()))
-        .slice(0, 4)
-        .map((m) => m.id);
-      console.error(
-        red(
-          `Unknown model "${cleanLog(chosenModel)}".${suggestions.length ? ` Did you mean: ${suggestions.map(cleanLog).join(", ")}?` : " Run `npx hallpassai models` to browse available models."}`,
-        ),
+      const compatiblePool = catalogModels.filter((m) =>
+        targets.some((agent) => isModelCompatibleWithAgent(agent, m)),
       );
-      return 1;
+      const fuzzy = filterModelsByQuery(compatiblePool, chosenModel);
+      if (fuzzy.length === 1) {
+        chosenModel = fuzzy[0].id;
+        catalogMatch = fuzzy[0];
+      } else if (interactiveTty && compatiblePool.length) {
+        const picked = await pickModelInteractive(compatiblePool, {
+          title: `Select default model for ${targets.join(", ")}`,
+          initialQuery: chosenModel,
+          input,
+          output,
+        });
+        if (!picked) {
+          console.log(dim("Cancelled."));
+          return 0;
+        }
+        chosenModel = picked;
+        catalogMatch = catalogModels.find((m) => m.id === chosenModel) || null;
+      } else {
+        const suggestions = fuzzy.slice(0, 4).map((m) => m.id);
+        console.error(
+          red(
+            `Unknown model "${cleanLog(chosenModel)}".${suggestions.length ? ` Did you mean: ${suggestions.map(cleanLog).join(", ")}?` : " Run `npx hallpassai use` to search interactively."}`,
+          ),
+        );
+        return 1;
+      }
     }
 
     const inferOfflineCompatible = () => true;
@@ -2185,10 +2228,32 @@ export async function main(
 
   let claimed;
   if (savedSetup) {
-    if (!(await verifyGatewayReachable(savedSetup, fetcher ? { fetcher } : undefined))) {
-      console.error(`Could not verify the saved HallPass key for ${args.agent}. Check \`hallpassai doctor\` or rerun setup with a fresh pairing code.`);
-      return 1;
+    const savedReachable = await verifyGatewayReachable(
+      savedSetup,
+      fetcher ? { fetcher } : undefined,
+    );
+    if (!savedReachable) {
+      if (interactiveTty) {
+        console.log(
+          dim(`Saved HallPass key for ${cleanLog(args.agent)} is no longer active; starting fresh sign-in…`),
+        );
+        savedSetup = null;
+        const authOrigin = resolveOrigin(null, args.origin);
+        args.code = await runBrowserAuthFlow({
+          origin: authOrigin,
+          agent: args.agent,
+          noBrowser: args.noBrowser,
+          input,
+          output,
+          openBrowser: openBrowser || openSystemBrowser,
+        });
+      } else {
+        console.error(`Could not verify the saved HallPass key for ${args.agent}. Check \`hallpassai doctor\` or rerun setup with a fresh pairing code.`);
+        return 1;
+      }
     }
+  }
+  if (savedSetup) {
     const models = await fetchCatalogDetails({ apiBase: savedSetup.apiBase, origin: args.origin }, fetcher ? { fetcher } : undefined);
     claimed = { ...savedSetup, harness: args.agent, models };
     args.reasoning ??= savedSetup.reasoning;

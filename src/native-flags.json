@@ -349,5 +349,17 @@
       "upgrade": ["--log-level","--major","--print-logs","--pure","-h, --help","-m, --method","-v, --version"],
       "web": ["--cors","--hostname","--log-level","--mdns","--mdns-domain","--port","--print-logs","--pure","-h, --help","-v, --version"]
     }
+  },
+  "cline": {
+    "version": "3.0.76",
+    "aliases": { "h": "history" },
+    "commands": {
+      "": ["--acp","--auto-approve <boolean>","--compaction <mode>","--config <path>","--data-dir <path>","--hooks-dir <path>","--id <session-id>","--json","--kanban","--retries <count>","--thinking <level>","--update","--worktree","-P, --provider <id>","-V, --version","-c, --cwd <path>","-h, --help","-i, --tui","-k, --key <api-key>","-m, --model <model-id>","-p, --plan","-s, --system <system-prompt>","-t, --timeout <seconds>","-v, --verbose","-y, --yolo","-z, --zen"],
+      "auth": ["-b, --base-url <url>","-h, --help","-k, --apikey <key>","-m, --modelid <model>","-p, --provider <provider>"],
+      "config": ["-h, --help"],
+      "doctor": ["-h, --help"],
+      "history": ["-h, --help"],
+      "version": ["-h, --help"]
+    }
   }
 }

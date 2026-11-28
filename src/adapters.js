@@ -19,6 +19,7 @@ export const SUPPORTED_AGENTS = [
   "opencode",
   "copilot",
   "cursor",
+  "cline",
 ];
 
 const TOML_HEADER_RE = /^\s*(\[\[?)\s*([^\]]+?)\s*\]\]?\s*(?:#.*)?$/;
@@ -155,6 +156,13 @@ function resolveCodexDir(homeDir = os.homedir(), env = process.env) {
   return path.join(path.resolve(homeDir), ".codex");
 }
 
+function resolveClineDir(homeDir, env = process.env) {
+  if (homeDir === os.homedir() && env.CLINE_DIR && path.isAbsolute(env.CLINE_DIR)) {
+    return path.resolve(env.CLINE_DIR);
+  }
+  return path.join(path.resolve(homeDir), ".cline");
+}
+
 function resolveOpencodeDirs(homeDir, env = process.env) {
   const useEnvXdg = homeDir === os.homedir();
   const configDir =
@@ -189,6 +197,12 @@ export function detectInstalledAgents(homeDir = os.homedir(), env = process.env,
   )
     found.push("opencode");
   if (hasCmd("copilot")) found.push("copilot");
+  if (
+    fs.existsSync(resolveClineDir(homeDir, env)) ||
+    fs.existsSync(path.join(homeDir, ".cline")) ||
+    hasCmd("cline")
+  )
+    found.push("cline");
   return found.length || !fallback ? found : ["claude-code"];
 }
 
@@ -231,6 +245,26 @@ export function detectExistingSubscription(agent, homeDir = os.homedir()) {
       const cpCfg = path.join(homeDir, ".copilot", "config.json");
       if (fs.existsSync(ghHosts) || fs.existsSync(cpCfg)) {
         return { detected: true, label: "GitHub Copilot login" };
+      }
+    } else if (agent === "cline") {
+      const providersPath = path.join(
+        resolveClineDir(homeDir),
+        "data",
+        "settings",
+        "providers.json",
+      );
+      if (fs.existsSync(providersPath)) {
+        const j = readJsonSafe(providersPath);
+        const curOpenAi = j?.providers?.["openai-compatible"]?.settings;
+        const isHallpass =
+          typeof curOpenAi?.baseUrl === "string" &&
+          /hallpassai\.com/i.test(curOpenAi.baseUrl);
+        if (
+          (j?.lastUsedProvider && j.lastUsedProvider !== "openai-compatible") ||
+          (curOpenAi?.apiKey && !isHallpass)
+        ) {
+          return { detected: true, label: "Cline provider login" };
+        }
       }
     }
   } catch {}
@@ -899,6 +933,17 @@ export function configureAgent(
         ? backupOnce(settingsPath, { secret: true })
         : null;
       writePrivateFile(settingsPath, content, 0o600);
+      // Clean up any stale coexist sidecar/shim from an earlier install so old keys never linger.
+      const staleSide = path.join(hallpassDir(homeDir), "claude-settings.json");
+      const staleShim = path.join(hallpassDir(homeDir), "bin", "claude-hp");
+      for (const stale of [staleSide, staleShim]) {
+        if (fs.existsSync(stale)) {
+          try {
+            assertNotSymlink(stale);
+            fs.unlinkSync(stale);
+          } catch {}
+        }
+      }
       return {
         agent,
         mode: "default",
@@ -1374,6 +1419,111 @@ export function configureAgent(
     };
   }
 
+  if (agent === "cline") {
+    const clineDir = resolveClineDir(homeDir);
+    const providersPath = path.join(clineDir, "data", "settings", "providers.json");
+    const chosenObj =
+      models.find((m) => m.id === model && m.protocols?.includes("chat/completions")) ||
+      models.find((m) => m.protocols?.includes("chat/completions")) ||
+      null;
+    const chosenModel = chosenObj?.id || model;
+    const clineThinking =
+      reasoningEffort && ["none", "low", "medium", "high", "xhigh"].includes(reasoningEffort)
+        ? reasoningEffort
+        : reasoningEffort === "max" || reasoningEffort === "ultra"
+          ? "xhigh"
+          : reasoningEffort === "minimal"
+            ? "low"
+            : null;
+    const currentCfg = readJsonSafe(providersPath);
+    const curOpenAi = currentCfg?.providers?.["openai-compatible"];
+    const wasHallpass =
+      typeof curOpenAi?.settings?.baseUrl === "string" &&
+      /hallpassai\.com/i.test(curOpenAi.settings.baseUrl);
+    const nextCfg = {
+      ...currentCfg,
+      version: currentCfg.version || 1,
+      lastUsedProvider: "openai-compatible",
+      modes:
+        currentCfg.modes && typeof currentCfg.modes === "object"
+          ? currentCfg.modes
+          : {},
+      providers: {
+        ...(currentCfg.providers && typeof currentCfg.providers === "object"
+          ? currentCfg.providers
+          : {}),
+        "openai-compatible": {
+          ...(curOpenAi && typeof curOpenAi === "object" ? curOpenAi : {}),
+          settings: {
+            ...(curOpenAi?.settings && typeof curOpenAi.settings === "object"
+              ? curOpenAi.settings
+              : {}),
+            provider: "openai-compatible",
+            apiKey: effectiveToken,
+            model: chosenModel,
+            baseUrl: apiBase,
+          },
+          updatedAt: new Date().toISOString(),
+          tokenSource: "manual",
+        },
+      },
+    };
+    const cfgContent = JSON.stringify(nextCfg, null, 2) + "\n";
+
+    if (!dryRun) {
+      if (effectiveMode === "default" && !wasHallpass) {
+        savePreviousAgentState(
+          "cline",
+          {
+            existed: fs.existsSync(providersPath),
+            previousLastUsedProvider: currentCfg.lastUsedProvider ?? null,
+            previousOpenAiCompatible: curOpenAi ?? null,
+          },
+          homeDir,
+        );
+      }
+      storeCredential(
+        "cline",
+        {
+          token,
+          apiBase,
+          model: chosenModel,
+          reasoning: clineThinking,
+          mode: effectiveMode,
+        },
+        { homeDir },
+      );
+      const hasOtherConfig = Boolean(
+        fs.existsSync(providersPath) &&
+          ((currentCfg.lastUsedProvider &&
+            currentCfg.lastUsedProvider !== "openai-compatible") ||
+            (curOpenAi?.settings?.apiKey && !wasHallpass)),
+      );
+      const backup = hasOtherConfig ? backupOnce(providersPath, { secret: true }) : null;
+      writePrivateFile(providersPath, cfgContent, 0o600);
+      return {
+        agent,
+        mode: effectiveMode,
+        appliedModel: chosenModel,
+        appliedReasoning: clineThinking,
+        files: [providersPath],
+        backup,
+        launchCommand: clineThinking ? `cline --thinking ${clineThinking}` : "cline",
+        nextStep: clineThinking
+          ? `Run \`cline --thinking ${clineThinking}\` in this terminal (or \`npx hallpassai run cline ${chosenModel}\`).`
+          : `Run \`cline\` in this terminal (or \`npx hallpassai run cline ${chosenModel}\`).`,
+      };
+    }
+    return {
+      agent,
+      mode: effectiveMode,
+      appliedModel: chosenModel,
+      appliedReasoning: clineThinking,
+      files: [providersPath],
+      preview: cfgContent,
+    };
+  }
+
   if (agent === "cursor") {
     const chosenModel =
       models.find(
@@ -1586,6 +1736,11 @@ export function addModelToAgent(
     return { agent, model: modelId, files: [], manual: true,
       hint: `In Cursor Settings → Models, choose Add Custom Model, enter ${modelId}, and press Enter.` };
   }
+
+  if (agent === "cline") {
+    return { agent, model: modelId, files: [],
+      hint: `Run \`npx hallpassai use ${modelId} --harness cline\` or \`npx hallpassai run cline ${modelId}\`.` };
+  }
   throw new Error(`Unsupported agent: ${agent}`);
 }
 
@@ -1792,6 +1947,52 @@ export function buildEphemeralLaunchSpec(
         COPILOT_PROVIDER_MAX_OUTPUT_TOKENS: "16384",
         COPILOT_PROVIDER_VISION: "true",
         COPILOT_PROVIDER_HEADERS: "X-Client-Name: copilot",
+      },
+    };
+  }
+
+  if (agent === "cline") {
+    const clineBin = resolveRealBinary("cline", cleanEnv, homeDir);
+    const runDir = path.join(hallpassDir(homeDir), "cline-run");
+    const providersPath = path.join(runDir, "data", "settings", "providers.json");
+    const providersPayload = {
+      version: 1,
+      lastUsedProvider: "openai-compatible",
+      modes: {},
+      providers: {
+        "openai-compatible": {
+          settings: {
+            provider: "openai-compatible",
+            apiKey: token,
+            model,
+            baseUrl: apiBase,
+          },
+          updatedAt: new Date().toISOString(),
+          tokenSource: "manual",
+        },
+      },
+    };
+    writePrivateFile(providersPath, JSON.stringify(providersPayload, null, 2) + "\n", 0o600);
+    const hasThinkingFlag = extraArgs.some(
+      (a) => a === "--thinking" || a.startsWith("--thinking="),
+    );
+    const mappedThinking =
+      reasoning && ["none", "low", "medium", "high", "xhigh"].includes(reasoning)
+        ? reasoning
+        : reasoning === "max" || reasoning === "ultra"
+          ? "xhigh"
+          : reasoning === "minimal"
+            ? "low"
+            : null;
+    return {
+      command: clineBin,
+      args:
+        mappedThinking && !hasThinkingFlag
+          ? ["--thinking", mappedThinking, ...extraArgs]
+          : [...extraArgs],
+      env: {
+        ...cleanEnv,
+        CLINE_DIR: runDir,
       },
     };
   }
@@ -2149,6 +2350,46 @@ function surgicallyRestoreGlobalConfig(
         }
       }
     }
+  } else if (a === "cline") {
+    const clineDir = resolveClineDir(homeDir);
+    const settingsDir = path.join(clineDir, "data", "settings");
+    const dataDir = path.join(clineDir, "data");
+    const providersPath = path.join(settingsDir, "providers.json");
+    if (fs.existsSync(providersPath)) {
+      const cur = readJsonSafe(providersPath);
+      if (prev?.previousOpenAiCompatible) {
+        cur.providers ||= {};
+        cur.providers["openai-compatible"] = prev.previousOpenAiCompatible;
+      } else if (cur.providers && typeof cur.providers === "object") {
+        delete cur.providers["openai-compatible"];
+      }
+      if (prev?.previousLastUsedProvider) {
+        cur.lastUsedProvider = prev.previousLastUsedProvider;
+      } else if (cur.lastUsedProvider === "openai-compatible" && !cur.providers?.["openai-compatible"]) {
+        const remaining = Object.keys(cur.providers || {});
+        if (remaining.length) cur.lastUsedProvider = remaining[0];
+        else delete cur.lastUsedProvider;
+      }
+      if (!keepAdditive) unlinkBak(providersPath);
+      const remainingProviders = Object.keys(cur.providers || {});
+      if (!keepAdditive && remainingProviders.length === 0 && (!prev || !prev.existed)) {
+        assertNotSymlink(providersPath);
+        fs.unlinkSync(providersPath);
+      } else {
+        writePrivateFile(providersPath, JSON.stringify(cur, null, 2) + "\n", 0o600);
+      }
+      touched.push(providersPath);
+    }
+    if (!keepAdditive) {
+      const runDir = path.join(hallpassDir(homeDir), "cline-run");
+      if (fs.existsSync(runDir)) {
+        fs.rmSync(runDir, { recursive: true, force: true });
+        touched.push(runDir);
+      }
+      removeIfEmptyDir(settingsDir);
+      removeIfEmptyDir(dataDir);
+      removeIfEmptyDir(clineDir);
+    }
   }
   return touched;
 }
@@ -2477,6 +2718,30 @@ export function inspectAgentConfig(
         note: ok
           ? "Credentials saved locally (set in Cursor → Settings → Models)"
           : "No stored Cursor credentials",
+      };
+    }
+    if (agent === "cline") {
+      const providersPath = path.join(
+        resolveClineDir(homeDir),
+        "data",
+        "settings",
+        "providers.json",
+      );
+      const cfg = readJsonSafe(providersPath);
+      const entry = cfg?.providers?.["openai-compatible"]?.settings;
+      const ok = Boolean(
+        cfg?.lastUsedProvider === "openai-compatible" &&
+          entry?.apiKey &&
+          entry?.baseUrl,
+      );
+      return {
+        ok,
+        configPath: providersPath,
+        diskModel: entry?.model || saved?.model || null,
+        diskReasoning: saved?.reasoning || null,
+        note: ok
+          ? "providers.json wired to HallPass (openai-compatible)"
+          : "Cline providers.json missing or not wired to HallPass",
       };
     }
   } catch (err) {

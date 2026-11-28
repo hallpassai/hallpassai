@@ -10,6 +10,7 @@ const KNOWN_HARNESSES = [
   "opencode",
   "copilot",
   "cursor",
+  "cline",
   "default",
   "all",
 ];

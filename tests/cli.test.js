@@ -1526,3 +1526,111 @@ test("Codex setup preserves web_search and restores the setting saved by older H
     undoAgent("codex", {homeDir: home});
     assert.match(fs.readFileSync(toml, "utf8"), /web_search = "disabled"/);
   }));
+
+test("cline adapter writes 0600 providers.json, preserves existing providers, supports use/run/pause/resume, and restores cleanly on undo", () =>
+  withTempHome((home) => {
+    const providersPath = path.join(home, ".cline", "data", "settings", "providers.json");
+    fs.mkdirSync(path.dirname(providersPath), { recursive: true });
+    fs.writeFileSync(
+      providersPath,
+      JSON.stringify(
+        {
+          version: 1,
+          lastUsedProvider: "anthropic",
+          modes: {},
+          providers: {
+            anthropic: {
+              settings: { provider: "anthropic", apiKey: "sk-ant-existing", model: "claude-sonnet-4-6" },
+            },
+          },
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+
+    assert.equal(detectExistingSubscription("cline", home).detected, true);
+
+    const preview = configureAgent("cline", SAMPLE_PAYLOAD, { homeDir: home, dryRun: true });
+    assert.match(preview.preview, /hp_live_••••••••/);
+    assert.equal(JSON.parse(fs.readFileSync(providersPath, "utf8")).lastUsedProvider, "anthropic");
+
+    const applied = configureAgent("cline", SAMPLE_PAYLOAD, {
+      homeDir: home,
+      reasoningEffort: "high",
+    });
+    assert.equal(applied.agent, "cline");
+    assert.equal(applied.appliedModel, "claude-sonnet-4-6");
+    assert.equal(applied.appliedReasoning, "high");
+    assert.ok(applied.backup && fs.existsSync(applied.backup));
+
+    const written = JSON.parse(fs.readFileSync(providersPath, "utf8"));
+    assert.equal(written.lastUsedProvider, "openai-compatible");
+    assert.equal(written.providers.anthropic.settings.apiKey, "sk-ant-existing");
+    assert.equal(written.providers["openai-compatible"].settings.apiKey, SAMPLE_PAYLOAD.token);
+    assert.equal(written.providers["openai-compatible"].settings.baseUrl, SAMPLE_PAYLOAD.apiBase);
+    assert.equal(written.providers["openai-compatible"].settings.model, "claude-sonnet-4-6");
+    if (process.platform !== "win32") {
+      assert.equal(fs.statSync(providersPath).mode & 0o777, 0o600);
+    }
+
+    const inspected = inspectAgentConfig("cline", { homeDir: home });
+    assert.equal(inspected.ok, true);
+    assert.equal(inspected.diskModel, "claude-sonnet-4-6");
+
+    switchAgentModel("cline", "claude-opus-5.5", {
+      homeDir: home,
+      reasoningEffort: "xhigh",
+      catalogModels: [
+        { id: "claude-opus-5.5", name: "Claude Opus 5.5", protocols: ["chat/completions"] },
+      ],
+    });
+    const switched = JSON.parse(fs.readFileSync(providersPath, "utf8"));
+    assert.equal(switched.providers["openai-compatible"].settings.model, "claude-opus-5.5");
+
+    const added = addModelToAgent("cline", "deepseek-v4.1-flash", {
+      homeDir: home,
+      catalogModels: [
+        { id: "deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash", protocols: ["chat/completions"] },
+      ],
+    });
+    assert.equal(added.agent, "cline");
+    assert.match(added.hint, /npx hallpassai use deepseek-v4\.1-flash --harness cline/);
+
+    const launch = buildEphemeralLaunchSpec("cline", {
+      homeDir: home,
+      token: SAMPLE_PAYLOAD.token,
+      apiBase: SAMPLE_PAYLOAD.apiBase,
+      model: "claude-opus-5.5",
+      reasoning: "high",
+      extraArgs: ["-p", "Say hello world"],
+    });
+    assert.deepEqual(launch.args, ["--thinking", "high", "-p", "Say hello world"]);
+    assert.ok(launch.env.CLINE_DIR);
+    const runCfg = JSON.parse(
+      fs.readFileSync(path.join(launch.env.CLINE_DIR, "data", "settings", "providers.json"), "utf8"),
+    );
+    assert.equal(runCfg.providers["openai-compatible"].settings.model, "claude-opus-5.5");
+
+    pauseAgent("cline", { homeDir: home });
+    const pausedCfg = JSON.parse(fs.readFileSync(providersPath, "utf8"));
+    assert.equal(pausedCfg.lastUsedProvider, "anthropic");
+    assert.equal(pausedCfg.providers["openai-compatible"], undefined);
+
+    resumeAgent("cline", {
+      homeDir: home,
+      catalogModels: [
+        { id: "claude-opus-5.5", name: "Claude Opus 5.5", protocols: ["chat/completions"] },
+      ],
+    });
+    const resumedCfg = JSON.parse(fs.readFileSync(providersPath, "utf8"));
+    assert.equal(resumedCfg.lastUsedProvider, "openai-compatible");
+    assert.equal(resumedCfg.providers["openai-compatible"].settings.model, "claude-opus-5.5");
+
+    undoAgent("cline", { homeDir: home, fullCleanup: true });
+    const restoredCfg = JSON.parse(fs.readFileSync(providersPath, "utf8"));
+    assert.equal(restoredCfg.lastUsedProvider, "anthropic");
+    assert.equal(restoredCfg.providers.anthropic.settings.apiKey, "sk-ant-existing");
+    assert.equal(restoredCfg.providers["openai-compatible"], undefined);
+    assert.equal(fs.existsSync(applied.backup), false);
+  }));
