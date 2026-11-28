@@ -212,10 +212,7 @@ function createStandaloneChatModel(modelId, settings = {}, config) {
     modelId,
     settings,
     supportsStructuredOutputs: Boolean(config.supportsStructuredOutputs),
-    supportedUrls: {
-      "image/*": [/^https?:\/\//i],
-      "application/pdf": [/^https?:\/\//i],
-    },
+    supportedUrls: {},
     async doGenerate(callOptions = {}) {
       const headers = ensureAuthorizedHeaders(
         config.headers,
@@ -320,10 +317,34 @@ function createStandaloneChatModel(modelId, settings = {}, config) {
           ? { stream_options: { include_usage: true } }
           : {}),
         messages: promptToMessages(callOptions.prompt),
+        ...(callOptions.maxOutputTokens !== undefined
+          ? { max_completion_tokens: callOptions.maxOutputTokens }
+          : {}),
+        ...(callOptions.temperature !== undefined
+          ? { temperature: callOptions.temperature }
+          : {}),
+        ...(callOptions.topP !== undefined ? { top_p: callOptions.topP } : {}),
+        ...(callOptions.stopSequences !== undefined
+          ? { stop: callOptions.stopSequences }
+          : {}),
+        ...(callOptions.seed !== undefined ? { seed: callOptions.seed } : {}),
         ...(reasoningEffort !== undefined
           ? { reasoning_effort: reasoningEffort }
           : {}),
+        ...(settings.user !== undefined ? { user: settings.user } : {}),
       };
+      if (callOptions.responseFormat?.type === "json") {
+        body.response_format = callOptions.responseFormat.schema
+          ? {
+              type: "json_schema",
+              json_schema: {
+                name: callOptions.responseFormat.name ?? "response",
+                strict: true,
+                schema: callOptions.responseFormat.schema,
+              },
+            }
+          : { type: "json_object" };
+      }
 
       const response = await fetcher(url, {
         method: "POST",
