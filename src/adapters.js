@@ -1705,11 +1705,12 @@ export function buildEphemeralLaunchSpec(
 
   if (agent === "opencode") {
     const ocBin = resolveRealBinary("opencode", cleanEnv, homeDir);
-    const mObj = catalogModels.find((m) => m.id === model) || {
-      id: model,
-      name: model,
+    const bareModel = String(model || "").replace(/^hallpass(?:-(?:responses|messages|chat))?\//i, "");
+    const mObj = catalogModels.find((m) => m.id === bareModel) || {
+      id: bareModel,
+      name: bareModel,
       protocols: ["chat/completions"],
-      reasoning: supportsReasoningId(model),
+      reasoning: supportsReasoningId(bareModel),
     };
     const mappedOcEff =
       reasoning && ["low", "medium", "high"].includes(reasoning)
@@ -1720,19 +1721,19 @@ export function buildEphemeralLaunchSpec(
             ? "low"
             : null;
     const eff =
-      mappedOcEff && (mObj.reasoning || supportsReasoningId(model))
+      mappedOcEff && (mObj.reasoning || supportsReasoningId(bareModel))
         ? mappedOcEff
         : null;
     const entries = {};
     for (const m of catalogModels.length ? catalogModels.filter((x) => x.protocols?.includes("chat/completions")) : [mObj]) {
-      entries[m.id] = buildOpencodeModelEntry(m, { chosenModel: model, ocEffort: eff });
+      entries[m.id] = buildOpencodeModelEntry(m, { chosenModel: bareModel, ocEffort: eff });
     }
-    if (!entries[model]) {
-      entries[model] = buildOpencodeModelEntry(mObj, { chosenModel: model, ocEffort: eff });
+    if (!entries[bareModel]) {
+      entries[bareModel] = buildOpencodeModelEntry(mObj, { chosenModel: bareModel, ocEffort: eff });
     }
     const inlineCfg = {
       $schema: "https://opencode.ai/config.json",
-      model: `hallpass/${model}`,
+      model: `hallpass/${bareModel}`,
       provider: {
         hallpass: {
           npm: "@ai-sdk/openai-compatible",
